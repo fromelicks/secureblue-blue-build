@@ -27,6 +27,7 @@ modules:
       packages:
         - micro
         - git
+        - golang
         - rclone
         - syncthing
         - keepassxc
