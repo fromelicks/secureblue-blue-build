@@ -1,0 +1,111 @@
+#!/bin/bash
+# Suspend/resume hang diagnostics for gnome-shell on Optimus (Intel+NVIDIA).
+#
+# Pre-suspend: records active user UID and gnome-shell PID.
+# Post-resume: background watchdog polls gnome-shell D-Bus every 30s.
+#   - Unresponsive: dumps /proc/<pid>/{wchan,status,stack} to journal.
+#   - Still unresponsive after 3 attempts (90s): sends SIGTERM to trigger GDM restart.
+#
+# Logs appear under:  journalctl -t gnome-diagnostics
+
+RUNDIR=/run/gnome-diagnostics
+
+log_info() { echo "$*" | systemd-cat -t gnome-diagnostics -p info; }
+log_warn()  { echo "$*" | systemd-cat -t gnome-diagnostics -p warning; }
+log_err()   { echo "$*" | systemd-cat -t gnome-diagnostics -p err; }
+
+# Return the UID of the first active graphical session user.
+get_active_uid() {
+  loginctl list-sessions --no-legend 2>/dev/null \
+    | awk 'NR==1{print $3}' \
+    | xargs -I{} id -u {} 2>/dev/null
+}
+
+# Return non-zero if gnome-shell's D-Bus does not respond within 5s.
+dbus_ping_gnome_shell() {
+  local uid="$1"
+  local user
+  user=$(id -nu "$uid" 2>/dev/null) || return 1
+  runuser -u "$user" -- env \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+    timeout 5 dbus-send --session \
+      --dest=org.gnome.Shell \
+      --print-reply \
+      /org/gnome/Shell \
+      org.gnome.Shell.Eval \
+      string:'1+1' \
+    >/dev/null 2>&1
+}
+
+# Dump gnome-shell process state to journal.
+collect_gnome_diag() {
+  local uid="$1"
+  local pid="$2"
+  {
+    echo "=== gnome-shell diagnostic dump at $(date -Iseconds) ==="
+    echo "PID: ${pid:-unknown}"
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+      echo "--- wchan (kernel wait channel) ---"
+      cat "/proc/$pid/wchan" 2>/dev/null || echo "(unavailable)"
+      echo ""
+      echo "--- status ---"
+      cat "/proc/$pid/status" 2>/dev/null || echo "(unavailable)"
+      echo "--- kernel stack ---"
+      cat "/proc/$pid/stack" 2>/dev/null \
+        || echo "(unavailable — requires ptrace scope; try: sysctl kernel.yama.ptrace_scope=0)"
+    fi
+    echo "--- recent gnome-shell journal (last 30 lines) ---"
+    journalctl --since "5 minutes ago" \
+      _UID="$uid" --no-pager -n 30 2>/dev/null || true
+  } | systemd-cat -t gnome-diagnostics -p warning
+}
+
+case "$1/$2" in
+  pre/suspend|pre/hybrid-sleep)
+    mkdir -p "$RUNDIR"
+    date -Iseconds > "$RUNDIR/suspend-time"
+    UID_ACTIVE=$(get_active_uid)
+    if [ -n "$UID_ACTIVE" ]; then
+      echo "$UID_ACTIVE" > "$RUNDIR/active-uid"
+      pgrep -u "$(id -nu "$UID_ACTIVE" 2>/dev/null)" -f "gnome-shell" 2>/dev/null \
+        | head -1 > "$RUNDIR/gnome-pid" || true
+    fi
+    log_info "suspend: pre-suspend captured (uid=${UID_ACTIVE:-none}, gnome-pid=$(cat "$RUNDIR/gnome-pid" 2>/dev/null || echo none))"
+    ;;
+
+  post/suspend|post/hybrid-sleep)
+    # Run async — does not block the resume sequence.
+    (
+      UID_ACTIVE=$(cat "$RUNDIR/active-uid" 2>/dev/null || get_active_uid)
+      GNOME_PID=$(cat "$RUNDIR/gnome-pid" 2>/dev/null || true)
+      [ -z "$UID_ACTIVE" ] && exit 0
+
+      FAIL=0
+      for attempt in 1 2 3; do
+        sleep 30
+        # Refresh PID in case it was restarted.
+        LIVE_PID=$(pgrep -u "$(id -nu "$UID_ACTIVE" 2>/dev/null)" -f "gnome-shell" 2>/dev/null \
+          | head -1 || true)
+        TARGET_PID="${LIVE_PID:-$GNOME_PID}"
+
+        if dbus_ping_gnome_shell "$UID_ACTIVE"; then
+          log_info "resume: gnome-shell responsive at attempt $attempt"
+          FAIL=0
+          break
+        else
+          FAIL=$((FAIL + 1))
+          log_warn "resume: gnome-shell unresponsive at attempt $attempt/3"
+          collect_gnome_diag "$UID_ACTIVE" "$TARGET_PID"
+        fi
+      done
+
+      if [ "$FAIL" -ge 3 ]; then
+        LIVE_PID=$(pgrep -u "$(id -nu "$UID_ACTIVE" 2>/dev/null)" -f "gnome-shell" 2>/dev/null \
+          | head -1 || true)
+        log_err "resume: gnome-shell hung for 90s; sending SIGTERM to PID ${LIVE_PID:-?} to trigger GDM restart"
+        [ -n "$LIVE_PID" ] && kill "$LIVE_PID" 2>/dev/null || true
+      fi
+    ) &
+    disown
+    ;;
+esac
