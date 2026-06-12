@@ -25,7 +25,8 @@ modules:
         - netbird.repo
       copr:
         enable:
-          - wezfurlong/wezterm-nightly
+          - name: wezfurlong/wezterm-nightly
+            chroot: fedora-44-x86_64
     install:
       packages:
         - micro
