@@ -77,6 +77,10 @@ modules:
           - org.gnome.Extensions
           - org.gnome.Weather
 
+  - type: kargs
+    kargs:
+      - loglevel=4
+
   - type: justfiles
     validate: true
 
