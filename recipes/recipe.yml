@@ -26,6 +26,7 @@ modules:
     install:
       packages:
         - micro
+        - fish
         - git
         - golang
         - rclone
