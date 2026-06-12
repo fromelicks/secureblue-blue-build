@@ -41,6 +41,7 @@ modules:
             - terra-release
             - terra-gpg-keys
             - zed
+            - ghostty
     # remove: # Example removal
     #   packages:
     #     - firefox
