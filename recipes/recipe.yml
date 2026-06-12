@@ -18,6 +18,7 @@ modules:
         destination: / # copies files/system/* (* means everything inside it) into your image's root folder /
 
   - type: dnf
+    source: ghcr.io/fromelicks/modules/dnf:latest
     repos:
       files:
         - https://cli.github.com/packages/rpm/gh-cli.repo
