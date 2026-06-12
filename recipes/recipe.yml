@@ -41,6 +41,8 @@ modules:
         - foot
         # Fedora package installs to system extension path; EGO build is hard-coded to user paths
         - gnome-shell-extension-gsconnect
+        # ghostty dep; must be pre-installed from Fedora repos before terra's --repoid-restricted install
+        - gtk4-layer-shell
         - gh
         - repo: terra
           packages:
