@@ -23,6 +23,9 @@ modules:
         - https://cli.github.com/packages/rpm/gh-cli.repo
         - https://raw.githubusercontent.com/terrapkg/subatomic-repos/main/terra.repo
         - netbird.repo
+      copr:
+        enable:
+          - wezfurlong/wezterm-nightly
     install:
       packages:
         - micro
@@ -43,6 +46,9 @@ modules:
             - terra-gpg-keys
             - zed
             - ghostty
+        - repo: copr:copr.fedorainfracloud.org:wezfurlong:wezterm-nightly
+          packages:
+            - wezterm
     # remove: # Example removal
     #   packages:
     #     - firefox
