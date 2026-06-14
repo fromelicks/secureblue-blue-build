@@ -21,35 +21,35 @@ modules:
     source: ghcr.io/fromelicks/modules/dnf:latest
     repos:
       files:
-        - https://cli.github.com/packages/rpm/gh-cli.repo
-        - https://raw.githubusercontent.com/terrapkg/subatomic-repos/main/terra.repo
+        - gh-cli.repo
         - netbird.repo
+        - terra.repo
       copr:
         enable:
           - name: wezfurlong/wezterm-nightly
             chroot: fedora-44-x86_64
     install:
       packages:
-        - micro
         - fish
+        - foot
+        - gamescope
+        - gh
+        - ghostty # repo: terra
         - git
         - golang
-        - rclone
-        - syncthing
         - keepassxc
         - kitty
-        - foot
+        - micro
+        - rclone
+        - syncthing
+        - xpra
+        - zed # repo: terra
         # Fedora package installs to system extension path; EGO build is hard-coded to user paths
         - gnome-shell-extension-gsconnect
-        # ghostty dep; must be pre-installed from Fedora repos before terra's --repoid-restricted install
-        - gtk4-layer-shell
-        - gh
         - repo: terra
           packages:
             - terra-release
             - terra-gpg-keys
-            - zed
-            - ghostty
         - repo: copr:copr.fedorainfracloud.org:wezfurlong:wezterm-nightly
           packages:
             - wezterm
