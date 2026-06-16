@@ -30,6 +30,7 @@ modules:
             chroot: fedora-44-x86_64
     install:
       packages:
+        - chezmoi
         - fish
         - foot
         - gamescope
@@ -42,6 +43,7 @@ modules:
         - micro
         - rclone
         - syncthing
+        - wezterm # repo: copr:copr.fedorainfracloud.org:wezfurlong:wezterm-nightly
         - xpra
         - zed # repo: terra
         # Fedora package installs to system extension path; EGO build is hard-coded to user paths
@@ -50,9 +52,6 @@ modules:
           packages:
             - terra-release
             - terra-gpg-keys
-        - repo: copr:copr.fedorainfracloud.org:wezfurlong:wezterm-nightly
-          packages:
-            - wezterm
     # remove: # Example removal
     #   packages:
     #     - firefox
