@@ -9,6 +9,10 @@ log_info() { echo "$*" | systemd-cat -t "$TAG" -p info; }
 log_warn() { echo "$*" | systemd-cat -t "$TAG" -p warning; }
 log_err() { echo "$*" | systemd-cat -t "$TAG" -p err; }
 
+seconds_ago() {
+  date -d "$1 seconds ago" -Iseconds 2>/dev/null || date -Iseconds
+}
+
 session_prop() {
   loginctl show-session "$1" -p "$2" --value 2>/dev/null || true
 }
@@ -80,7 +84,10 @@ collect_state() {
   local label="$1"
   local uid="${2:-}"
   local pid="${3:-}"
+  local since="${4:-}"
   local user=""
+
+  [ -n "$since" ] || since=$(seconds_ago 120)
 
   if [ -n "$uid" ]; then
     user=$(id -nu "$uid" 2>/dev/null || true)
@@ -129,10 +136,10 @@ collect_state() {
       done
     done
     echo "--- recent kernel warnings ---"
-    journalctl -k --since "2 minutes ago" -p warning..alert --no-pager 2>/dev/null || true
+    journalctl -k --since "$since" -p warning..alert --no-pager 2>/dev/null || true
     if [ -n "$uid" ]; then
       echo "--- recent user journal ---"
-      journalctl --since "2 minutes ago" _UID="$uid" --no-pager -n 80 2>/dev/null || true
+      journalctl --since "$since" _UID="$uid" --no-pager -n 80 2>/dev/null || true
     fi
   } | systemd-cat -t "$TAG" -p warning
 }
@@ -151,15 +158,16 @@ case "$1/$2" in
     fi
     date -Iseconds > "$RUNDIR/suspend-time"
     log_info "suspend: pre-suspend captured (uid=${UID_ACTIVE:-none}, gnome-pid=${GNOME_PID:-none})"
-    collect_state "pre-suspend snapshot" "$UID_ACTIVE" "$GNOME_PID"
+    collect_state "pre-suspend snapshot" "$UID_ACTIVE" "$GNOME_PID" "$(seconds_ago 120)"
     ;;
 
   post/suspend|post/hybrid-sleep)
+    RESUME_SINCE=$(seconds_ago 15)
     UID_ACTIVE=$(cat "$RUNDIR/active-uid" 2>/dev/null || get_active_uid || true)
     GNOME_PID=$(cat "$RUNDIR/gnome-pid" 2>/dev/null || true)
     if [ -n "$UID_ACTIVE" ]; then
       LIVE_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
-      collect_state "post-resume immediate snapshot" "$UID_ACTIVE" "${LIVE_PID:-$GNOME_PID}"
+      collect_state "post-resume immediate snapshot" "$UID_ACTIVE" "${LIVE_PID:-$GNOME_PID}" "$RESUME_SINCE"
     else
       log_warn "resume: no active non-root graphical user found"
     fi
@@ -182,7 +190,7 @@ case "$1/$2" in
         else
           FAIL=$((FAIL + 1))
           log_warn "resume: gnome-shell unresponsive at attempt $attempt/3"
-          collect_state "gnome-shell unresponsive attempt $attempt" "$UID_ACTIVE" "$TARGET_PID"
+          collect_state "gnome-shell unresponsive attempt $attempt" "$UID_ACTIVE" "$TARGET_PID" "$(seconds_ago 60)"
         fi
       done
 

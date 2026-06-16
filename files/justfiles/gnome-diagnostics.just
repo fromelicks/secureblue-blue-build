@@ -83,12 +83,16 @@ disable-gnome-coredumps:
 debug-suspend-cycle:
     #!/usr/bin/env bash
     set -euo pipefail
-    MARK="manual suspend-cycle $(date -Iseconds)"
+    START=$(date -Iseconds)
+    MARK="manual suspend-cycle ${START}"
     systemd-cat -t gnome-diagnostics -p warning <<< "manual: starting ${MARK}"
     run0 -i systemctl suspend
     sleep 10
     systemd-cat -t gnome-diagnostics -p warning <<< "manual: resumed ${MARK}"
-    journalctl -b -t gnome-diagnostics --no-pager -n 200
+    if [ -x /etc/systemd/system-sleep/99-gnome-diagnostics ]; then
+        run0 -i /etc/systemd/system-sleep/99-gnome-diagnostics post suspend
+    fi
+    journalctl -b -t gnome-diagnostics --since "$START" --no-pager
 
 # Enable verbose mutter/KMS/DRM debug logging (writes a user-local drop-in).
 # Takes effect after: systemctl --user restart "org.gnome.Shell@user.service"
