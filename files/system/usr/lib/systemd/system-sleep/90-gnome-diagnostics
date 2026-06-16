@@ -1,30 +1,69 @@
 #!/bin/bash
-# Suspend/resume hang diagnostics for gnome-shell on Optimus (Intel+NVIDIA).
-#
-# Pre-suspend: records active user UID and gnome-shell PID.
-# Post-resume: background watchdog polls gnome-shell D-Bus every 30s.
-#   - Unresponsive: dumps /proc/<pid>/{wchan,status,stack} to journal.
-#   - Still unresponsive after 3 attempts (90s): sends SIGTERM to trigger GDM restart.
-#
-# Logs appear under:  journalctl -t gnome-diagnostics
+# Suspend/resume diagnostics for GNOME Shell on Optimus (Intel+NVIDIA).
+# Logs appear under: journalctl -t gnome-diagnostics
 
 RUNDIR=/run/gnome-diagnostics
+TAG=gnome-diagnostics
 
-log_info() { echo "$*" | systemd-cat -t gnome-diagnostics -p info; }
-log_warn()  { echo "$*" | systemd-cat -t gnome-diagnostics -p warning; }
-log_err()   { echo "$*" | systemd-cat -t gnome-diagnostics -p err; }
+log_info() { echo "$*" | systemd-cat -t "$TAG" -p info; }
+log_warn() { echo "$*" | systemd-cat -t "$TAG" -p warning; }
+log_err() { echo "$*" | systemd-cat -t "$TAG" -p err; }
 
-# Return the UID of the first active graphical session user.
+session_prop() {
+  loginctl show-session "$1" -p "$2" --value 2>/dev/null || true
+}
+
+# Return the UID of the active local graphical user, never root or greeter.
 get_active_uid() {
-  loginctl list-sessions --no-legend 2>/dev/null \
-    | awk 'NR==1{print $3}' \
-    | xargs -I{} id -u {} 2>/dev/null
+  local sid uid name class type state remote active user
+
+  while read -r sid _; do
+    [ -n "$sid" ] || continue
+    uid=$(session_prop "$sid" User)
+    name=$(session_prop "$sid" Name)
+    class=$(session_prop "$sid" Class)
+    type=$(session_prop "$sid" Type)
+    state=$(session_prop "$sid" State)
+    remote=$(session_prop "$sid" Remote)
+    active=$(session_prop "$sid" Active)
+
+    [ -n "$uid" ] || continue
+    [ "$uid" != "0" ] || continue
+    [ "$name" != "gdm-greeter" ] || continue
+    [ "$class" = "user" ] || continue
+    [ "$remote" != "yes" ] || continue
+    case "$type" in wayland|x11) ;; *) continue ;; esac
+    case "$state" in active|online) ;; *) continue ;; esac
+    [ "$active" != "no" ] || continue
+    echo "$uid"
+    return 0
+  done < <(loginctl list-sessions --no-legend 2>/dev/null)
+
+  # Fallback: choose the first non-root local user with a running gnome-shell.
+  while read -r sid _; do
+    [ -n "$sid" ] || continue
+    uid=$(session_prop "$sid" User)
+    name=$(session_prop "$sid" Name)
+    [ -n "$uid" ] || continue
+    [ "$uid" != "0" ] || continue
+    [ "$name" != "gdm-greeter" ] || continue
+    user=$(id -nu "$uid" 2>/dev/null) || continue
+    if pgrep -u "$user" -x gnome-shell >/dev/null 2>&1; then
+      echo "$uid"
+      return 0
+    fi
+  done < <(loginctl list-sessions --no-legend 2>/dev/null)
+}
+
+get_gnome_pid() {
+  local uid="$1" user
+  user=$(id -nu "$uid" 2>/dev/null) || return 1
+  pgrep -u "$user" -x gnome-shell 2>/dev/null | head -1
 }
 
 # Return non-zero if gnome-shell's D-Bus does not respond within 5s.
 dbus_ping_gnome_shell() {
-  local uid="$1"
-  local user
+  local uid="$1" user
   user=$(id -nu "$uid" 2>/dev/null) || return 1
   runuser -u "$user" -- env \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
@@ -37,55 +76,103 @@ dbus_ping_gnome_shell() {
     >/dev/null 2>&1
 }
 
-# Dump gnome-shell process state to journal.
-collect_gnome_diag() {
-  local uid="$1"
-  local pid="$2"
+collect_state() {
+  local label="$1"
+  local uid="${2:-}"
+  local pid="${3:-}"
+  local user=""
+
+  if [ -n "$uid" ]; then
+    user=$(id -nu "$uid" 2>/dev/null || true)
+  fi
+
   {
-    echo "=== gnome-shell diagnostic dump at $(date -Iseconds) ==="
-    echo "PID: ${pid:-unknown}"
-    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
-      echo "--- wchan (kernel wait channel) ---"
-      cat "/proc/$pid/wchan" 2>/dev/null || echo "(unavailable)"
-      echo ""
-      echo "--- status ---"
-      cat "/proc/$pid/status" 2>/dev/null || echo "(unavailable)"
-      echo "--- kernel stack ---"
-      cat "/proc/$pid/stack" 2>/dev/null \
-        || echo "(unavailable — requires ptrace scope; try: sysctl kernel.yama.ptrace_scope=0)"
+    echo "=== ${label} at $(date -Iseconds) ==="
+    echo "boot_id: $(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    echo "kernel_cmdline: $(cat /proc/cmdline 2>/dev/null || true)"
+    echo "core_pattern: $(cat /proc/sys/kernel/core_pattern 2>/dev/null || true)"
+    echo "uid: ${uid:-none}"
+    echo "user: ${user:-none}"
+    echo "gnome_pid: ${pid:-none}"
+    echo "--- login sessions ---"
+    loginctl list-sessions --no-legend 2>/dev/null || true
+    echo "--- inhibitors ---"
+    systemd-inhibit --list --no-pager 2>/dev/null || true
+    if [ -n "$user" ]; then
+      echo "--- gnome-shell service ---"
+      runuser -u "$user" -- env \
+        XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+        systemctl --user show org.gnome.Shell@user.service \
+          -p MainPID -p Result -p ExecMainCode -p ExecMainStatus -p LimitCORE \
+        2>/dev/null || true
     fi
-    echo "--- recent gnome-shell journal (last 30 lines) ---"
-    journalctl --since "5 minutes ago" \
-      _UID="$uid" --no-pager -n 30 2>/dev/null || true
-  } | systemd-cat -t gnome-diagnostics -p warning
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+      echo "--- gnome-shell wchan ---"
+      cat "/proc/$pid/wchan" 2>/dev/null || true
+      echo "--- gnome-shell status ---"
+      cat "/proc/$pid/status" 2>/dev/null || true
+      echo "--- gnome-shell limits ---"
+      cat "/proc/$pid/limits" 2>/dev/null || true
+      echo "--- gnome-shell kernel stack ---"
+      cat "/proc/$pid/stack" 2>/dev/null || true
+    fi
+    echo "--- drm devices ---"
+    ls -l /dev/dri /dev/dri/by-path 2>/dev/null || true
+    for dev in /sys/class/drm/card[0-9]*; do
+      [ -e "$dev" ] || continue
+      case "$(basename "$dev")" in card[0-9]*) ;; *) continue ;; esac
+      [ -r "$dev/device/vendor" ] || continue
+      echo "[$dev]"
+      for f in device/vendor device/device device/power/control device/power/runtime_status device/power/runtime_suspended_time; do
+        [ -f "$dev/$f" ] && [ -r "$dev/$f" ] && printf '%s=' "$f" && cat "$dev/$f"
+      done
+    done
+    echo "--- recent kernel warnings ---"
+    journalctl -k --since "2 minutes ago" -p warning..alert --no-pager 2>/dev/null || true
+    if [ -n "$uid" ]; then
+      echo "--- recent user journal ---"
+      journalctl --since "2 minutes ago" _UID="$uid" --no-pager -n 80 2>/dev/null || true
+    fi
+  } | systemd-cat -t "$TAG" -p warning
 }
 
 case "$1/$2" in
   pre/suspend|pre/hybrid-sleep)
     mkdir -p "$RUNDIR"
-    date -Iseconds > "$RUNDIR/suspend-time"
-    UID_ACTIVE=$(get_active_uid)
+    UID_ACTIVE=$(get_active_uid || true)
+    GNOME_PID=""
     if [ -n "$UID_ACTIVE" ]; then
+      GNOME_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
       echo "$UID_ACTIVE" > "$RUNDIR/active-uid"
-      pgrep -u "$(id -nu "$UID_ACTIVE" 2>/dev/null)" -f "gnome-shell" 2>/dev/null \
-        | head -1 > "$RUNDIR/gnome-pid" || true
+      echo "$GNOME_PID" > "$RUNDIR/gnome-pid"
+    else
+      rm -f "$RUNDIR/active-uid" "$RUNDIR/gnome-pid"
     fi
-    log_info "suspend: pre-suspend captured (uid=${UID_ACTIVE:-none}, gnome-pid=$(cat "$RUNDIR/gnome-pid" 2>/dev/null || echo none))"
+    date -Iseconds > "$RUNDIR/suspend-time"
+    log_info "suspend: pre-suspend captured (uid=${UID_ACTIVE:-none}, gnome-pid=${GNOME_PID:-none})"
+    collect_state "pre-suspend snapshot" "$UID_ACTIVE" "$GNOME_PID"
     ;;
 
   post/suspend|post/hybrid-sleep)
-    # Run async — does not block the resume sequence.
+    UID_ACTIVE=$(cat "$RUNDIR/active-uid" 2>/dev/null || get_active_uid || true)
+    GNOME_PID=$(cat "$RUNDIR/gnome-pid" 2>/dev/null || true)
+    if [ -n "$UID_ACTIVE" ]; then
+      LIVE_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
+      collect_state "post-resume immediate snapshot" "$UID_ACTIVE" "${LIVE_PID:-$GNOME_PID}"
+    else
+      log_warn "resume: no active non-root graphical user found"
+    fi
+
     (
-      UID_ACTIVE=$(cat "$RUNDIR/active-uid" 2>/dev/null || get_active_uid)
+      UID_ACTIVE=$(cat "$RUNDIR/active-uid" 2>/dev/null || get_active_uid || true)
       GNOME_PID=$(cat "$RUNDIR/gnome-pid" 2>/dev/null || true)
       [ -z "$UID_ACTIVE" ] && exit 0
 
       FAIL=0
       for attempt in 1 2 3; do
         sleep 30
-        # Refresh PID in case it was restarted.
-        LIVE_PID=$(pgrep -u "$(id -nu "$UID_ACTIVE" 2>/dev/null)" -f "gnome-shell" 2>/dev/null \
-          | head -1 || true)
+        LIVE_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
         TARGET_PID="${LIVE_PID:-$GNOME_PID}"
 
         if dbus_ping_gnome_shell "$UID_ACTIVE"; then
@@ -95,13 +182,12 @@ case "$1/$2" in
         else
           FAIL=$((FAIL + 1))
           log_warn "resume: gnome-shell unresponsive at attempt $attempt/3"
-          collect_gnome_diag "$UID_ACTIVE" "$TARGET_PID"
+          collect_state "gnome-shell unresponsive attempt $attempt" "$UID_ACTIVE" "$TARGET_PID"
         fi
       done
 
       if [ "$FAIL" -ge 3 ]; then
-        LIVE_PID=$(pgrep -u "$(id -nu "$UID_ACTIVE" 2>/dev/null)" -f "gnome-shell" 2>/dev/null \
-          | head -1 || true)
+        LIVE_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
         log_err "resume: gnome-shell hung for 90s; sending SIGTERM to PID ${LIVE_PID:-?} to trigger GDM restart"
         [ -n "$LIVE_PID" ] && kill "$LIVE_PID" 2>/dev/null || true
       fi

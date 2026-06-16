@@ -42,6 +42,54 @@ collect-gnome-diag:
 show-resume-diagnostics:
     journalctl -t gnome-diagnostics --no-pager -n 200
 
+# Temporarily enable coredumps for GNOME Shell crash debugging.
+[group('Diagnostics')]
+enable-gnome-coredumps:
+    #!/usr/bin/env bash
+    # Overrides secureblue's runtime coredump hardening only until disabled or rebooted.
+    set -euo pipefail
+    HANDLER='|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h %d %F'
+    printf '%s\n' "$HANDLER" | run0 -i tee /proc/sys/kernel/core_pattern >/dev/null
+    DROPIN=~/.config/systemd/user/org.gnome.Shell@user.service.d
+    mkdir -p "$DROPIN"
+    printf '[Service]\nLimitCORE=infinity\n' > "$DROPIN/99-gnome-coredump-local.conf"
+    systemctl --user daemon-reload
+    GNOME_PID=$(systemctl --user show "org.gnome.Shell@user.service" -p MainPID --value 2>/dev/null || true)
+    if [ -n "$GNOME_PID" ] && [ "$GNOME_PID" != "0" ]; then
+        run0 -i prlimit --pid "$GNOME_PID" --core=unlimited || true
+    fi
+    echo "Temporary GNOME Shell coredumps enabled."
+    echo "Current core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+    echo "Current GNOME core limit: $(grep -i '^Max core file size' /proc/${GNOME_PID}/limits 2>/dev/null || echo unknown)"
+    echo "For future GNOME Shell instances, log out and back in if needed."
+
+# Disable temporary GNOME Shell coredump collection again.
+[group('Diagnostics')]
+disable-gnome-coredumps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf '%s\n' '|/bin/false' | run0 -i tee /proc/sys/kernel/core_pattern >/dev/null
+    rm -f ~/.config/systemd/user/org.gnome.Shell@user.service.d/99-gnome-coredump-local.conf
+    systemctl --user daemon-reload
+    GNOME_PID=$(systemctl --user show "org.gnome.Shell@user.service" -p MainPID --value 2>/dev/null || true)
+    if [ -n "$GNOME_PID" ] && [ "$GNOME_PID" != "0" ]; then
+        run0 -i prlimit --pid "$GNOME_PID" --core=0 || true
+    fi
+    echo "Temporary GNOME Shell coredumps disabled."
+    echo "Current core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+
+# Deliberately run one suspend/resume cycle and show the captured diagnostics.
+[group('Diagnostics')]
+debug-suspend-cycle:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    MARK="manual suspend-cycle $(date -Iseconds)"
+    systemd-cat -t gnome-diagnostics -p warning <<< "manual: starting ${MARK}"
+    run0 -i systemctl suspend
+    sleep 10
+    systemd-cat -t gnome-diagnostics -p warning <<< "manual: resumed ${MARK}"
+    journalctl -b -t gnome-diagnostics --no-pager -n 200
+
 # Enable verbose mutter/KMS/DRM debug logging (writes a user-local drop-in).
 # Takes effect after: systemctl --user restart "org.gnome.Shell@user.service"
 # WARNING: fills journal rapidly; disable after capturing the needed data.
