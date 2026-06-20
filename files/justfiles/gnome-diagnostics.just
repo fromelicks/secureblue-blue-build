@@ -94,6 +94,23 @@ debug-suspend-cycle:
     fi
     journalctl -b -t gnome-diagnostics --since "$START" --no-pager
 
+# Disable the 50-gnome-freeze sleep hook (SIGSTOP/SIGCONT mitigation) until re-enabled.
+# Use to test for regressions (e.g. desktop stays black too long after resume).
+[group('Diagnostics')]
+disable-gnome-freeze:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run0 -i touch /etc/gnome-freeze.disabled
+    echo "50-gnome-freeze hook disabled. Re-enable with: ujust enable-gnome-freeze"
+
+# Re-enable the 50-gnome-freeze sleep hook after it was disabled.
+[group('Diagnostics')]
+enable-gnome-freeze:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run0 -i rm -f /etc/gnome-freeze.disabled
+    echo "50-gnome-freeze hook re-enabled."
+
 # Enable verbose mutter/KMS/DRM debug logging (writes a user-local drop-in).
 # Takes effect after: systemctl --user restart "org.gnome.Shell@user.service"
 # WARNING: fills journal rapidly; disable after capturing the needed data.

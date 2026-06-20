@@ -1,0 +1,82 @@
+#!/bin/bash
+# SIGSTOP gnome-shell before suspend; delay SIGCONT until NVIDIA DRM is ready on resume.
+# This prevents the DRM EPERM that causes mutter KMS thread deadlock on Optimus resume.
+#
+# The crucial part is the DELAYED SIGCONT: runtime_status=active does not mean the NVIDIA
+# DRM driver has reacquired master. We poll for active then add a 2s settle before unblocking
+# gnome-shell so it cannot issue any DRM commits during the unsafe resume window.
+#
+# Disable at runtime: sudo touch /etc/gnome-freeze.disabled
+# Re-enable:          sudo rm /etc/gnome-freeze.disabled
+
+RUNDIR=/run/gnome-freeze
+TAG=gnome-freeze
+
+log_info() { echo "$*" | systemd-cat -t "$TAG" -p info; }
+log_warn() { echo "$*" | systemd-cat -t "$TAG" -p warning; }
+
+# Find the NVIDIA DRM card by PCI vendor ID 0x10de
+find_nvidia_card() {
+  local card vendor
+  for card in /sys/class/drm/card[0-9]*; do
+    [ -d "$card" ] || continue
+    vendor=$(cat "$card/device/vendor" 2>/dev/null || true)
+    [ "$vendor" = "0x10de" ] && echo "$card" && return 0
+  done
+  return 1
+}
+
+# Poll until runtime_status=active, up to timeout seconds.
+wait_nvidia_active() {
+  local card="$1" timeout="${2:-10}" i=0 max status
+  max=$(( timeout * 2 ))
+  while [ "$i" -lt "$max" ]; do
+    status=$(cat "$card/device/power/runtime_status" 2>/dev/null || echo "unknown")
+    [ "$status" = "active" ] && return 0
+    sleep 0.5
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+# Admin disable flag
+[ -f /etc/gnome-freeze.disabled ] && exit 0
+
+case "$1/$2" in
+  pre/suspend|pre/hybrid-sleep)
+    mkdir -p "$RUNDIR"
+    pgrep -x gnome-shell 2>/dev/null > "$RUNDIR/frozen-pids" || true
+    PIDS=$(tr '\n' ' ' < "$RUNDIR/frozen-pids")
+    PIDS="${PIDS%% }"
+    if [ -n "$PIDS" ]; then
+      # shellcheck disable=SC2086
+      kill -STOP $PIDS 2>/dev/null || true
+      log_info "freeze: SIGSTOP → gnome-shell PIDs: $PIDS"
+    else
+      log_info "freeze: no gnome-shell processes found"
+    fi
+    ;;
+
+  post/suspend|post/hybrid-sleep)
+    PIDS=$(tr '\n' ' ' < "$RUNDIR/frozen-pids" 2>/dev/null || true)
+    PIDS="${PIDS%% }"
+    CARD=$(find_nvidia_card || true)
+
+    if [ -n "$CARD" ]; then
+      if wait_nvidia_active "$CARD" 10; then
+        # runtime_status=active precedes DRM master reacquisition; 2s settle prevents EPERM.
+        sleep 2
+        log_info "freeze: NVIDIA active + 2s settle; SIGCONT → PIDs: ${PIDS:-none}"
+      else
+        log_warn "freeze: NVIDIA not active after 10s; SIGCONT anyway → PIDs: ${PIDS:-none}"
+      fi
+    else
+      log_warn "freeze: no NVIDIA card found; 3s fallback settle; SIGCONT → PIDs: ${PIDS:-none}"
+      sleep 3
+    fi
+
+    # shellcheck disable=SC2086
+    [ -n "$PIDS" ] && kill -CONT $PIDS 2>/dev/null || true
+    rm -f "$RUNDIR/frozen-pids"
+    ;;
+esac

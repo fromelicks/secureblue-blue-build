@@ -172,34 +172,44 @@ case "$1/$2" in
       log_warn "resume: no active non-root graphical user found"
     fi
 
-    (
-      UID_ACTIVE=$(cat "$RUNDIR/active-uid" 2>/dev/null || get_active_uid || true)
-      GNOME_PID=$(cat "$RUNDIR/gnome-pid" 2>/dev/null || true)
-      [ -z "$UID_ACTIVE" ] && exit 0
+    # Launch watchdog as its own transient service so it survives this hook's cgroup teardown.
+    systemd-run --collect \
+      -- /usr/lib/systemd/system-sleep/90-gnome-diagnostics watchdog "$2" \
+      >/dev/null 2>&1 \
+      || log_warn "resume: failed to launch gnome-resume watchdog via systemd-run"
+    ;;
 
-      FAIL=0
-      for attempt in 1 2 3; do
-        sleep 30
-        LIVE_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
-        TARGET_PID="${LIVE_PID:-$GNOME_PID}"
+  watchdog/suspend|watchdog/hybrid-sleep)
+    # Invoked via systemd-run from post/suspend; runs in its own cgroup, survives hook exit.
+    UID_ACTIVE=$(cat "$RUNDIR/active-uid" 2>/dev/null || get_active_uid || true)
+    GNOME_PID=$(cat "$RUNDIR/gnome-pid" 2>/dev/null || true)
+    [ -z "$UID_ACTIVE" ] && exit 0
 
-        if dbus_ping_gnome_shell "$UID_ACTIVE"; then
-          log_info "resume: gnome-shell responsive at attempt $attempt"
-          FAIL=0
-          break
-        else
-          FAIL=$((FAIL + 1))
-          log_warn "resume: gnome-shell unresponsive at attempt $attempt/3"
-          collect_state "gnome-shell unresponsive attempt $attempt" "$UID_ACTIVE" "$TARGET_PID" "$(seconds_ago 60)"
-        fi
-      done
+    FAIL=0
+    for attempt in 1 2 3; do
+      sleep 30
+      LIVE_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
+      TARGET_PID="${LIVE_PID:-$GNOME_PID}"
 
-      if [ "$FAIL" -ge 3 ]; then
-        LIVE_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
-        log_err "resume: gnome-shell hung for 90s; sending SIGTERM to PID ${LIVE_PID:-?} to trigger GDM restart"
-        [ -n "$LIVE_PID" ] && kill "$LIVE_PID" 2>/dev/null || true
+      if dbus_ping_gnome_shell "$UID_ACTIVE"; then
+        log_info "resume: gnome-shell responsive at attempt $attempt"
+        FAIL=0
+        break
+      else
+        FAIL=$((FAIL + 1))
+        log_warn "resume: gnome-shell unresponsive at attempt $attempt/3"
+        collect_state "gnome-shell unresponsive attempt $attempt" "$UID_ACTIVE" "$TARGET_PID" "$(seconds_ago 60)"
       fi
-    ) &
-    disown
+    done
+
+    if [ "$FAIL" -ge 3 ]; then
+      LIVE_PID=$(get_gnome_pid "$UID_ACTIVE" || true)
+      log_err "resume: gnome-shell hung for 90s; sending SIGCONT+SIGTERM to PID ${LIVE_PID:-?} to trigger GDM restart"
+      if [ -n "$LIVE_PID" ]; then
+        kill -CONT "$LIVE_PID" 2>/dev/null || true
+        sleep 0.1
+        kill "$LIVE_PID" 2>/dev/null || true
+      fi
+    fi
     ;;
 esac
