@@ -41,6 +41,7 @@ modules:
         - keepassxc
         - kitty
         - micro
+        - mise
         - rclone
         - syncthing
         - wezterm # repo: copr:copr.fedorainfracloud.org:wezfurlong:wezterm-nightly
