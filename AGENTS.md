@@ -13,7 +13,7 @@ image as the base; keep this repo a thin, auditable layer.
 - **Hardware target:** Lenovo Legion 5 16IRX9 — i7-14650HX, **hybrid graphics** (Intel iGPU +
   NVIDIA RTX 4060, nvidia-open), 32 GB RAM. Dual-boots with BitLocker Windows on a *separate* SSD
   (independent bootloaders via UEFI boot order — no GRUB chainloading).
-- **FDE:** LUKS2, passphrase now; TPM2 keyslot (sealed to PCR 7) to be added later via
+- **FDE:** LUKS2, passphrase now; TPM2 keyslot (sealed to PCR 7) added via
   `systemd-cryptenroll`, passphrase retained as fallback.
 
 ## Design principles (apply to every change)
