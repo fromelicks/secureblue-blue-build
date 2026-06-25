@@ -1,5 +1,19 @@
 # Notes
 
+## TPM2 LUKS unlock stops working after rebase / kernel update
+
+`ujust setup-luks-tpm-unlock` seals to **PCR 7 + PCR 14**. PCR 14 covers the MOK list and
+boot entries, so it changes on every image rebase or kernel update. When it does, the TPM
+portion fails even with the correct PIN and LUKS falls back to prompting for the PIN then the
+passphrase.
+
+**Fix:** re-run `ujust setup-luks-tpm-unlock`, answer `y` to "Wipe it and re-enroll?", enter
+the LUKS passphrase, and set a new PIN. This re-seals the slot to the current PCR values.
+
+You'll need this after every rebase until/unless the enrollment is changed to omit PCR 14.
+
+---
+
 ## Coexisting WireGuard VPN and NetBird
 
 ### Problem
