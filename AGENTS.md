@@ -44,6 +44,15 @@ image as the base; keep this repo a thin, auditable layer.
   pulls the latest secureblue base. Requires repo secret `SIGNING_SECRET` to match `cosign.pub`.
 - `cosign.pub` — signing pubkey (also baked into the image policy by the `signing` module)
 
+## Hardware-specific notes and known issues
+
+Documented findings for this machine's quirks. Read the linked doc before
+touching the relevant subsystem.
+
+| Area | Doc | Summary |
+|---|---|---|
+| WiFi + S2Idle suspend | [`docs/wifi-s2idle-suspend.md`](docs/wifi-s2idle-suspend.md) | Intel CNVi 9560 enters D3cold on S2Idle resume → firmware NMI → device stuck in reset across warm reboots. Fix: udev rule + sleep hook setting `d3cold_allowed=0`. S2Idle vs S3 tradeoff documented there. |
+
 ## Cross-cutting secureblue constraints (MUST be handled)
 
 These gate multiple features. Verified against secureblue source.
