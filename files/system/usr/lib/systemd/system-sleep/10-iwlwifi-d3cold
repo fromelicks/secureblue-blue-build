@@ -1,0 +1,8 @@
+#!/bin/bash
+# Udev does not re-trigger on S2Idle wakeup, so re-apply d3cold_allowed=0
+# here. The udev rule handles boot and S3 cold-resume cases.
+case "$1" in
+  post)
+    echo 0 > /sys/bus/pci/devices/0000:00:14.3/d3cold_allowed 2>/dev/null || true
+    ;;
+esac

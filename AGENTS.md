@@ -44,6 +44,15 @@ image as the base; keep this repo a thin, auditable layer.
   pulls the latest secureblue base. Requires repo secret `SIGNING_SECRET` to match `cosign.pub`.
 - `cosign.pub` — signing pubkey (also baked into the image policy by the `signing` module)
 
+## Hardware-specific notes and known issues
+
+Documented findings for this machine's quirks. Read the linked doc before
+touching the relevant subsystem.
+
+| Area | Doc | Summary |
+|---|---|---|
+| WiFi + S2Idle suspend | [`docs/wifi-s2idle-suspend.md`](docs/wifi-s2idle-suspend.md) | Intel CNVi 9560 enters D3cold on S2Idle resume → firmware NMI → device stuck in reset across warm reboots. Fix: udev rule + sleep hook setting `d3cold_allowed=0`. S2Idle vs S3 tradeoff documented there. |
+
 ## Cross-cutting secureblue constraints (MUST be handled)
 
 These gate multiple features. Verified against secureblue source.
@@ -76,9 +85,6 @@ These gate multiple features. Verified against secureblue source.
 
 | Feature | Where | How | Notes / gotchas |
 |---|---|---|---|
-| `registries.d` + key | image | likely already baked by `signing` module — verify `/usr/share/pki/containers/` and `/usr/etc/containers/registries.d/` first; only add via `files` if pulling other images from the namespace | probably redundant |
-| **NetBird** | image | `dnf` module + NetBird's own repo (`pkgs.netbird.io/yum/netbird.repo`); `systemd` enable; auth key via systemd-creds at runtime | `ujust install-vpn` does NOT support NetBird (only ivpn/mullvad/proton/tailscale, and it layers = drift). Switch DNS to systemd-resolved when bringing NetBird up. |
-| **Container runtime** | image (built-in) | use **Podman** (already present); enable Podman docker-compat socket if Docker API needed | Do NOT install Docker — root daemon + `docker` group is a root-equivalent hole secureblue's audit flags. `ujust install-docker` layers it = drift. |
 | **Firecracker** | image | `script` module fetches binary | needs `/dev/kvm` → see constraint 6 |
 | **gVisor (runsc)** | image | `script` module (NOT in secureblue at all) | collides with userns (constraint 4) + ptrace hardening + needs kvm/seccomp exceptions. Reconsider value on top of existing SELinux+userns hardening. |
 | **JuiceFS** | image (binary) + runtime (mount) | `script` fetches binary; mount via systemd unit; creds via systemd-creds | fuse3 |

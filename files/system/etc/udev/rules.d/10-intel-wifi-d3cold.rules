@@ -1,0 +1,4 @@
+# Intel CNVi Wi-Fi (700 Series, 8086:7a70) enters D3cold during S2Idle
+# suspend and cannot re-initialize the CNVR RF chip on resume. Keep the
+# device in D3hot instead so the voltage sequencer survives the cycle.
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{device}=="0x7a70", ATTR{d3cold_allowed}="0"
