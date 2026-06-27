@@ -1,0 +1,16 @@
+#!/bin/bash
+# Intel CNVi (9560, iwlwifi + iwlmvm) CNVR RF chip fails to re-sequence
+# its power supply after S2Idle (freeze) resume, causing a firmware NMI
+# crash and leaving the PCIe device stuck in reset on next boot.
+# Remove the driver entirely before suspend; iwlwifi re-probes cleanly
+# on resume and NetworkManager reconnects automatically.
+
+case "$1" in
+  pre)
+    modprobe -r iwlwifi 2>/dev/null || true
+    ;;
+  post)
+    sleep 1
+    modprobe iwlwifi
+    ;;
+esac
