@@ -1,0 +1,32 @@
+[Unit]
+Description=Capture Bluetooth HCI traffic for intermittent mouse disconnect diagnosis
+Documentation=man:btmon(1)
+Wants=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/fromelicks-btmon-capture
+Restart=always
+RestartSec=5s
+RuntimeMaxSec=1d
+
+# Captures can contain sensitive Bluetooth traffic. Keep them root-only and
+# allow writes only to the service-managed state directory.
+StateDirectory=bluetooth-captures
+StateDirectoryMode=0700
+UMask=0077
+StandardOutput=null
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

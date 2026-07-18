@@ -65,6 +65,7 @@ modules:
   - type: systemd
     system:
       enabled:
+        - btmon-capture.service
         - netbird.service
     user:
       enabled:
