@@ -31,6 +31,9 @@ modules:
     install:
       packages:
         - chezmoi
+        - clang
+        - clang-tools-extra
+        - compiler-rt
         - fish
         - foot
         - gamescope
@@ -40,6 +43,10 @@ modules:
         - golang
         - keepassxc
         - kitty
+        - libomp-devel
+        - lld
+        - lldb
+        - llvm
         - micro
         - mise
         - rclone
