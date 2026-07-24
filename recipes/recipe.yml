@@ -51,6 +51,7 @@ modules:
         - micro
         - mise
         - rclone
+        - sbcl
         - syncthing
         - wezterm # repo: copr:copr.fedorainfracloud.org:wezfurlong:wezterm-nightly
         - xpra
