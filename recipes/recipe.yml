@@ -21,6 +21,7 @@ modules:
     source: ghcr.io/fromelicks/modules/dnf:latest
     repos:
       files:
+        - fury-nushell.repo
         - gh-cli.repo
         - netbird.repo
         - terra.repo
@@ -52,6 +53,7 @@ modules:
         - llvm
         - micro
         - mise
+        - nushell # repo: files:fury-nushell.repo
         - rclone
         - sbcl
         - syncthing
