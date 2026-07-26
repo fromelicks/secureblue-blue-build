@@ -13,4 +13,3 @@ update-fromelicks:
         rpm-ostree rebase "$TARGET"
     fi
     echo ""
-    echo "Update queued — run 'systemctl reboot' to apply."
