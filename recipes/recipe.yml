@@ -24,6 +24,7 @@ modules:
         - gh-cli.repo
         - netbird.repo
         - terra.repo
+        - vscode.repo
       copr:
         enable:
           - name: wezfurlong/wezterm-nightly
@@ -33,6 +34,7 @@ modules:
         - chezmoi
         - clang
         - clang-tools-extra
+        - code # repo: files:vscode.repo
         - compiler-rt
         - emacs
         - fish
@@ -55,7 +57,7 @@ modules:
         - syncthing
         - wezterm # repo: copr:copr.fedorainfracloud.org:wezfurlong:wezterm-nightly
         - xpra
-        - zed # repo: terra
+        - zed # repo: files:terra.repo
         # Fedora package installs to system extension path; EGO build is hard-coded to user paths
         - gnome-shell-extension-gsconnect
         - repo: terra
