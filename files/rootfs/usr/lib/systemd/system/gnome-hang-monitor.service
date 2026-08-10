@@ -1,0 +1,36 @@
+[Unit]
+Description=Detect, diagnose, and recover an unresponsive GNOME Shell
+Documentation=https://github.com/fromelicks/secureblue-blue-build/issues/13
+After=gdm.service systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/fromelicks-gnome-hang-monitor monitor
+Restart=always
+RestartSec=10s
+
+# Three failed Shell-owned D-Bus probes produce detailed snapshots before the
+# monitor terminates the hung shell and lets GDM recover the session.
+Environment=CHECK_INTERVAL_SECONDS=30
+Environment=PROBE_TIMEOUT_SECONDS=5
+Environment=FAILURE_LIMIT=3
+Environment=RECOVER_HUNG_SHELL=yes
+
+RuntimeDirectory=gnome-diagnostics
+RuntimeDirectoryMode=0700
+UMask=0077
+
+# Root is required to inspect every compositor thread and signal a shell owned
+# by the graphical user. Keep the service read-only and narrowly capability-bound.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE
+
+[Install]
+WantedBy=graphical.target

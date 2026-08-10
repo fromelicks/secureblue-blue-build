@@ -1,46 +1,65 @@
 # ── GNOME suspend/resume hang diagnostics ──────────────────────────────────
 
-# Check whether gnome-shell is currently responding to D-Bus.
+# Check whether gnome-shell's main loop is currently responding to D-Bus.
 [group('Diagnostics')]
 check-gnome-health:
     #!/usr/bin/env bash
     set -euo pipefail
-    if dbus-send --session \
+    if timeout 5 dbus-send --session \
         --dest=org.gnome.Shell \
         --print-reply \
         /org/gnome/Shell \
         org.gnome.Shell.Eval \
-        string:'1+1' >/dev/null 2>&1; then
+        string:true >/dev/null 2>&1; then
         echo "gnome-shell is responding"
     else
         echo "ERROR: gnome-shell is NOT responding"
         exit 1
     fi
 
-# Collect and print a gnome-shell diagnostic snapshot right now.
+# Collect a full root-level gnome-shell/DRM diagnostic snapshot right now.
 [group('Diagnostics')]
 collect-gnome-diag:
     #!/usr/bin/env bash
     set -euo pipefail
+    UID_ACTIVE=$(id -u)
     GNOME_PID=$(systemctl --user show "org.gnome.Shell@user.service" -p MainPID --value 2>/dev/null || true)
-    echo "=== gnome-shell diagnostic snapshot at $(date -Iseconds) ==="
-    echo "PID: ${GNOME_PID:-unknown}"
-    if [ -n "$GNOME_PID" ] && [ -d "/proc/$GNOME_PID" ]; then
-        echo "--- wchan ---"
-        cat "/proc/$GNOME_PID/wchan" 2>/dev/null || echo "(unavailable)"
-        echo ""
-        echo "--- status ---"
-        cat "/proc/$GNOME_PID/status" 2>/dev/null || echo "(unavailable)"
-        echo "--- kernel stack (may require elevated ptrace scope) ---"
-        cat "/proc/$GNOME_PID/stack" 2>/dev/null || echo "(unavailable)"
-    fi
-    echo "--- recent gnome-shell journal (last 50 lines) ---"
-    journalctl --user --no-pager -n 50 2>/dev/null || true
+    [ -n "$GNOME_PID" ] && [ "$GNOME_PID" != "0" ] || {
+        echo "ERROR: no user gnome-shell process found"
+        exit 1
+    }
+    run0 -i /usr/libexec/fromelicks-gnome-hang-monitor \
+        snapshot "manual diagnostic snapshot" "$UID_ACTIVE" "$GNOME_PID" 180 full
+    echo "Snapshot written to journald."
+    journalctl -b -t gnome-diagnostics --since '2 minutes ago' --no-pager
 
-# Show all hang-detection log entries captured by the sleep hook.
+# Show continuous monitor and suspend/resume diagnostic entries.
 [group('Diagnostics')]
 show-resume-diagnostics:
-    journalctl -t gnome-diagnostics --no-pager -n 200
+    journalctl -b -t gnome-diagnostics --no-pager -n 400
+
+# Show the continuous GNOME hang monitor's service status.
+[group('Diagnostics')]
+status-gnome-hang-monitor:
+    systemctl status gnome-hang-monitor.service --no-pager
+
+# Archive the obsolete local sleep-hook copy created by older diagnostics.
+# Run once after rebasing to an image containing gnome-hang-monitor.service.
+[group('Diagnostics')]
+retire-old-gnome-sleep-hook:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    OLD=/etc/systemd/system-sleep/99-gnome-diagnostics
+    ARCHIVE=/var/lib/fromelicks/retired-system-sleep-hooks
+    if [ ! -e "$OLD" ]; then
+        echo "No obsolete local sleep hook is present."
+        exit 0
+    fi
+    STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+    TARGET="$ARCHIVE/99-gnome-diagnostics.$STAMP"
+    run0 -i install -d -m 0700 "$ARCHIVE"
+    run0 -i mv -- "$OLD" "$TARGET"
+    echo "Archived obsolete hook at $TARGET"
 
 # Temporarily enable coredumps for GNOME Shell crash debugging.
 [group('Diagnostics')]
@@ -89,9 +108,6 @@ debug-suspend-cycle:
     run0 -i systemctl suspend
     sleep 10
     systemd-cat -t gnome-diagnostics -p warning <<< "manual: resumed ${MARK}"
-    if [ -x /etc/systemd/system-sleep/99-gnome-diagnostics ]; then
-        run0 -i /etc/systemd/system-sleep/99-gnome-diagnostics post suspend
-    fi
     journalctl -b -t gnome-diagnostics --since "$START" --no-pager
 
 # Enable verbose mutter/KMS/DRM debug logging (writes a user-local drop-in).

@@ -79,6 +79,7 @@ modules:
     system:
       enabled:
         - btmon-capture.service
+        - gnome-hang-monitor.service
         - netbird.service
     user:
       enabled:

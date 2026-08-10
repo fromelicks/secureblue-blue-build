@@ -1,0 +1,434 @@
+#!/bin/bash
+# Continuously detect and diagnose a live-but-unresponsive GNOME Shell.
+#
+# The monitor runs as a constrained system service so it can inspect every
+# thread in the user's compositor and recover the session even while the lock
+# screen is active. Diagnostic output is written to journald with the
+# "gnome-diagnostics" identifier.
+
+set -u
+
+TAG=gnome-diagnostics
+RUNDIR=/run/gnome-diagnostics
+SLEEP_MARKER=$RUNDIR/system-sleep-active
+
+CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-30}
+PROBE_TIMEOUT_SECONDS=${PROBE_TIMEOUT_SECONDS:-5}
+FAILURE_LIMIT=${FAILURE_LIMIT:-3}
+RECOVER_HUNG_SHELL=${RECOVER_HUNG_SHELL:-yes}
+RECOVERY_DISABLE_FILE=$RUNDIR/no-recovery
+
+log_info() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p info; }
+log_warn() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p warning; }
+log_err() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p err; }
+
+seconds_ago() {
+  date -d "$1 seconds ago" -Iseconds 2>/dev/null || date -Iseconds
+}
+
+session_prop() {
+  loginctl show-session "$1" -p "$2" --value 2>/dev/null || true
+}
+
+# Return the UID of the active local graphical user, never root or the greeter.
+get_active_uid() {
+  local sid uid name class type state remote active user
+
+  while read -r sid _; do
+    [ -n "$sid" ] || continue
+    uid=$(session_prop "$sid" User)
+    name=$(session_prop "$sid" Name)
+    class=$(session_prop "$sid" Class)
+    type=$(session_prop "$sid" Type)
+    state=$(session_prop "$sid" State)
+    remote=$(session_prop "$sid" Remote)
+    active=$(session_prop "$sid" Active)
+
+    [ -n "$uid" ] || continue
+    [ "$uid" != "0" ] || continue
+    [ "$name" != "gdm-greeter" ] || continue
+    [ "$class" = "user" ] || continue
+    [ "$remote" != "yes" ] || continue
+    case "$type" in wayland|x11) ;; *) continue ;; esac
+    case "$state" in active|online) ;; *) continue ;; esac
+    [ "$active" != "no" ] || continue
+    printf '%s\n' "$uid"
+    return 0
+  done < <(loginctl list-sessions --no-legend 2>/dev/null)
+
+  # The user session can become inactive when GDM takes the foreground VT.
+  # Continue watching any local non-greeter user that still owns gnome-shell.
+  while read -r sid _; do
+    [ -n "$sid" ] || continue
+    uid=$(session_prop "$sid" User)
+    name=$(session_prop "$sid" Name)
+    [ -n "$uid" ] || continue
+    [ "$uid" != "0" ] || continue
+    [ "$name" != "gdm-greeter" ] || continue
+    user=$(id -nu "$uid" 2>/dev/null) || continue
+    if pgrep -u "$user" -x gnome-shell >/dev/null 2>&1; then
+      printf '%s\n' "$uid"
+      return 0
+    fi
+  done < <(loginctl list-sessions --no-legend 2>/dev/null)
+
+  return 1
+}
+
+get_gnome_pid() {
+  local uid="$1" user
+  user=$(id -nu "$uid" 2>/dev/null) || return 1
+  pgrep -u "$user" -x gnome-shell 2>/dev/null | head -1
+}
+
+pid_is_gnome_shell_for_uid() {
+  local pid="$1" expected_uid="$2" actual_uid comm
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -d "/proc/$pid" ] || return 1
+  read -r comm < "/proc/$pid/comm" 2>/dev/null || return 1
+  actual_uid=$(awk '/^Uid:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null)
+  [ "$comm" = "gnome-shell" ] && [ "$actual_uid" = "$expected_uid" ]
+}
+
+# org.gnome.Shell.Eval is implemented by Shell's JavaScript D-Bus object, so a
+# reply proves that the compositor's main context dispatched the call. Eval is
+# disabled in hardened production sessions and normally returns false; that is
+# still a successful health response. The expression itself has no side effect
+# if evaluation is enabled.
+probe_gnome_shell_main_loop() {
+  local uid="$1" user
+  user=$(id -nu "$uid" 2>/dev/null) || return 1
+  runuser -u "$user" -- env \
+    XDG_RUNTIME_DIR="/run/user/${uid}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+    timeout "$PROBE_TIMEOUT_SECONDS" dbus-send --session \
+      --dest=org.gnome.Shell \
+      --print-reply \
+      /org/gnome/Shell \
+      org.gnome.Shell.Eval \
+      string:true \
+    >/dev/null 2>&1
+}
+
+print_proc_file() {
+  local path="$1"
+  if [ -r "$path" ]; then
+    cat "$path" 2>/dev/null || printf '(read failed)\n'
+  else
+    printf '(unavailable)\n'
+  fi
+}
+
+collect_thread_state() {
+  local pid="$1" task tid comm fd target
+
+  echo "--- gnome-shell threads ---"
+  ps -L -p "$pid" -o pid,tid,psr,stat,wchan:40,pcpu,comm 2>&1 || true
+
+  for task in "/proc/$pid"/task/[0-9]*; do
+    [ -d "$task" ] || continue
+    tid=${task##*/}
+    comm=$(cat "$task/comm" 2>/dev/null || printf unknown)
+    echo "[thread tid=$tid comm=$comm]"
+    printf 'wchan: '
+    print_proc_file "$task/wchan"
+    printf 'syscall: '
+    print_proc_file "$task/syscall"
+    echo "kernel stack:"
+    print_proc_file "$task/stack"
+  done
+
+  echo "--- gnome-shell DRM file descriptors ---"
+  for fd in "/proc/$pid"/fd/[0-9]*; do
+    [ -e "$fd" ] || continue
+    target=$(readlink "$fd" 2>/dev/null || true)
+    case "$target" in /dev/dri/*)
+      echo "[fd=${fd##*/} target=$target]"
+      print_proc_file "/proc/$pid/fdinfo/${fd##*/}"
+      ;;
+    esac
+  done
+
+  echo "--- gnome-shell memory map ---"
+  print_proc_file "/proc/$pid/maps"
+
+  echo "--- gnome-shell userspace stacks (eu-stack, 15s limit) ---"
+  if command -v eu-stack >/dev/null 2>&1; then
+    timeout -k 2s 15s eu-stack -p "$pid" 2>&1 || echo "(eu-stack failed or timed out)"
+  else
+    echo "(eu-stack unavailable)"
+  fi
+}
+
+collect_drm_state() {
+  local card connector field
+
+  echo "--- drm devices ---"
+  ls -l /dev/dri /dev/dri/by-path 2>/dev/null || true
+  for card in /sys/class/drm/card[0-9]*; do
+    [ -r "$card/device/vendor" ] || continue
+    echo "[$card]"
+    for field in \
+      device/vendor \
+      device/device \
+      device/power/control \
+      device/power/runtime_status \
+      device/power/runtime_suspended_time \
+      device/d3cold_allowed; do
+      if [ -r "$card/$field" ]; then
+        printf '%s=' "$field"
+        cat "$card/$field" 2>/dev/null || true
+      fi
+    done
+  done
+
+  echo "--- drm connectors ---"
+  for connector in /sys/class/drm/card[0-9]*-*; do
+    [ -r "$connector/status" ] || continue
+    printf '%s status=' "$connector"
+    cat "$connector/status" 2>/dev/null || true
+    if [ -r "$connector/enabled" ]; then
+      printf '%s enabled=' "$connector"
+      cat "$connector/enabled" 2>/dev/null || true
+    fi
+  done
+
+  echo "--- NVIDIA state (5s limit) ---"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    timeout -k 2s 5s nvidia-smi \
+      --query-gpu=pci.bus_id,pstate,power.draw,memory.used,display_active,display_mode \
+      --format=csv,noheader 2>&1 || echo "(nvidia-smi failed or timed out)"
+  else
+    echo "(nvidia-smi unavailable)"
+  fi
+
+  echo "--- DRM debugfs clients and atomic state (bounded) ---"
+  for field in /sys/kernel/debug/dri/[0-9]*/clients /sys/kernel/debug/dri/[0-9]*/state; do
+    [ -r "$field" ] || continue
+    echo "[$field]"
+    timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
+  done
+}
+
+collect_drm_clients() {
+  local proc pid client_fd detail_fd fd_number target key comm uid context
+  declare -A seen=()
+
+  echo "--- processes with open DRM devices ---"
+  for proc in /proc/[0-9]*; do
+    [ -d "$proc/fd" ] || continue
+    pid=${proc##*/}
+    for client_fd in "$proc"/fd/[0-9]*; do
+      [ -e "$client_fd" ] || continue
+      target=$(readlink "$client_fd" 2>/dev/null || true)
+      case "$target" in /dev/dri/*) ;; *) continue ;; esac
+
+      key="$pid:$target"
+      [ -z "${seen[$key]:-}" ] || continue
+      seen[$key]=1
+      comm=$(cat "$proc/comm" 2>/dev/null || printf unknown)
+      uid=$(awk '/^Uid:/ { print $2; exit }' "$proc/status" 2>/dev/null)
+      context=$(cat "$proc/attr/current" 2>/dev/null || printf unavailable)
+      echo "[pid=$pid uid=${uid:-unknown} comm=$comm device=$target context=$context]"
+
+      # Record every fdinfo entry for this process/device pair. DRM fdinfo
+      # carries the driver, client ID, engine, and memory accounting data.
+      for detail_fd in "$proc"/fd/[0-9]*; do
+        [ -e "$detail_fd" ] || continue
+        [ "$(readlink "$detail_fd" 2>/dev/null || true)" = "$target" ] || continue
+        fd_number=${detail_fd##*/}
+        echo "[pid=$pid fd=$fd_number]"
+        print_proc_file "$proc/fdinfo/$fd_number"
+      done
+    done
+  done
+}
+
+collect_state() {
+  local label="$1" uid="${2:-}" pid="${3:-}" lookback="${4:-120}" detail="${5:-standard}"
+  local user="" since
+
+  since=$(seconds_ago "$lookback")
+  [ -z "$uid" ] || user=$(id -nu "$uid" 2>/dev/null || true)
+
+  {
+    echo "=== $label at $(date -Iseconds) ==="
+    echo "boot_id: $(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    echo "uptime: $(cat /proc/uptime 2>/dev/null || true)"
+    echo "kernel_cmdline: $(cat /proc/cmdline 2>/dev/null || true)"
+    echo "mem_sleep: $(cat /sys/power/mem_sleep 2>/dev/null || true)"
+    echo "core_pattern: $(cat /proc/sys/kernel/core_pattern 2>/dev/null || true)"
+    echo "uid: ${uid:-none}"
+    echo "user: ${user:-none}"
+    echo "gnome_pid: ${pid:-none}"
+    echo "--- login sessions ---"
+    loginctl list-sessions --no-legend 2>/dev/null || true
+    echo "--- inhibitors ---"
+    timeout 5 systemd-inhibit --list --no-pager 2>/dev/null || true
+
+    if [ -n "$user" ]; then
+      echo "--- gnome-shell user service ---"
+      timeout 5 runuser -u "$user" -- env \
+        XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+        systemctl --user show org.gnome.Shell@user.service \
+          -p ActiveState -p SubState -p MainPID -p Result \
+          -p ExecMainCode -p ExecMainStatus -p LimitCORE \
+        2>/dev/null || true
+    fi
+
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+      echo "--- gnome-shell process status ---"
+      print_proc_file "/proc/$pid/status"
+      echo "--- gnome-shell limits ---"
+      print_proc_file "/proc/$pid/limits"
+      if [ "$detail" = "full" ]; then
+        collect_thread_state "$pid"
+      else
+        echo "--- gnome-shell thread summary ---"
+        ps -L -p "$pid" -o pid,tid,psr,stat,wchan:40,pcpu,comm 2>&1 || true
+      fi
+    fi
+
+    collect_drm_state
+    if [ "$detail" = "full" ]; then
+      collect_drm_clients
+    fi
+    echo "--- recent display, sleep, and SELinux events ---"
+    journalctl -b --since "$since" --no-pager -n 240 \
+      --grep='drmModeAtomicCommit|NVRM: Xid|i915.*(hang|reset)|PrepareForSleep|PM: suspend|PM: resume|USER_AVC|avc:.*denied' \
+      2>/dev/null || true
+    echo "--- recent kernel warnings ---"
+    journalctl -b -k --since "$since" -p warning..alert --no-pager 2>/dev/null || true
+    if [ -n "$uid" ]; then
+      echo "--- recent user journal ---"
+      journalctl -b --since "$since" _UID="$uid" --no-pager -n 120 2>/dev/null || true
+    fi
+  } | systemd-cat -t "$TAG" -p warning
+}
+
+recover_shell() {
+  local uid="$1" expected_pid="$2" live_pid
+
+  live_pid=$(get_gnome_pid "$uid" 2>/dev/null || true)
+  if [ "$live_pid" != "$expected_pid" ] || ! pid_is_gnome_shell_for_uid "$live_pid" "$uid"; then
+    log_warn "monitor: recovery skipped; tracked gnome-shell PID $expected_pid is no longer current"
+    return 0
+  fi
+
+  if [ "$RECOVER_HUNG_SHELL" != "yes" ] || [ -e "$RECOVERY_DISABLE_FILE" ]; then
+    log_err "monitor: recovery disabled; leaving hung gnome-shell PID $live_pid running"
+    return 0
+  fi
+
+  log_err "monitor: $FAILURE_LIMIT consecutive health failures; sending SIGCONT+SIGTERM to gnome-shell PID $live_pid"
+  kill -CONT "$live_pid" 2>/dev/null || true
+  sleep 0.1
+  kill -TERM "$live_pid" 2>/dev/null || true
+}
+
+monitor_loop() {
+  local uid pid tracked_pid="" failures=0
+
+  mkdir -p "$RUNDIR"
+  log_info "monitor: started (interval=${CHECK_INTERVAL_SECONDS}s timeout=${PROBE_TIMEOUT_SECONDS}s failures=${FAILURE_LIMIT} recovery=${RECOVER_HUNG_SHELL})"
+  trap 'log_info "monitor: stopped"; exit 0' TERM INT
+
+  while true; do
+    if [ -e "$SLEEP_MARKER" ]; then
+      failures=0
+      sleep "$CHECK_INTERVAL_SECONDS"
+      continue
+    fi
+
+    uid=$(get_active_uid 2>/dev/null || true)
+    pid=""
+    [ -z "$uid" ] || pid=$(get_gnome_pid "$uid" 2>/dev/null || true)
+
+    if [ -z "$uid" ] || ! pid_is_gnome_shell_for_uid "$pid" "$uid"; then
+      if [ -n "$tracked_pid" ]; then
+        log_info "monitor: gnome-shell PID $tracked_pid is no longer present; waiting for a user session"
+      fi
+      tracked_pid=""
+      failures=0
+      sleep "$CHECK_INTERVAL_SECONDS"
+      continue
+    fi
+
+    if [ "$pid" != "$tracked_pid" ]; then
+      tracked_pid="$pid"
+      failures=0
+      log_info "monitor: tracking gnome-shell PID $pid for UID $uid"
+      # Allow a newly started shell to acquire its D-Bus name before probing.
+      sleep "$CHECK_INTERVAL_SECONDS"
+      continue
+    fi
+
+    if probe_gnome_shell_main_loop "$uid"; then
+      if [ "$failures" -gt 0 ]; then
+        log_info "monitor: gnome-shell PID $pid recovered after $failures health failure(s)"
+      fi
+      failures=0
+    else
+      # systemd freezes the user slice before invoking system-sleep hooks. A
+      # probe already in flight can therefore time out after suspend has begun.
+      # Do not count or diagnose that expected failure once the hook's marker
+      # is visible.
+      if [ -e "$SLEEP_MARKER" ]; then
+        if [ "$failures" -gt 0 ]; then
+          log_info "monitor: discarding pending health failures because system sleep began"
+        fi
+        failures=0
+        sleep "$CHECK_INTERVAL_SECONDS"
+        continue
+      fi
+
+      failures=$((failures + 1))
+      log_warn "monitor: gnome-shell PID $pid unresponsive (attempt $failures/$FAILURE_LIMIT)"
+      collect_state \
+        "gnome-shell unresponsive attempt $failures/$FAILURE_LIMIT" \
+        "$uid" "$pid" 180 full
+
+      if [ "$failures" -ge "$FAILURE_LIMIT" ]; then
+        # A suspend can begin while the full diagnostic snapshot is running.
+        # Recheck immediately before taking any recovery action.
+        if [ -e "$SLEEP_MARKER" ]; then
+          log_info "monitor: recovery cancelled because system sleep began"
+        else
+          recover_shell "$uid" "$pid"
+        fi
+        tracked_pid=""
+        failures=0
+      fi
+    fi
+
+    sleep "$CHECK_INTERVAL_SECONDS"
+  done
+}
+
+case "${1:-monitor}" in
+  monitor)
+    monitor_loop
+    ;;
+  active-uid)
+    get_active_uid
+    ;;
+  gnome-pid)
+    get_gnome_pid "${2:?UID required}"
+    ;;
+  probe)
+    probe_gnome_shell_main_loop "${2:?UID required}"
+    ;;
+  snapshot)
+    collect_state \
+      "${2:?label required}" \
+      "${3:-}" \
+      "${4:-}" \
+      "${5:-120}" \
+      "${6:-standard}"
+    ;;
+  *)
+    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]}" >&2
+    exit 2
+    ;;
+esac
