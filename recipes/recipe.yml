@@ -109,3 +109,4 @@ modules:
     validate: true
 
   - type: signing # this sets up the proper policy & signing files for signed images to work fully
+    source: ghcr.io/fromelicks/modules:pr-4
