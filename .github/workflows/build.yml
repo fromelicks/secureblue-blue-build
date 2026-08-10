@@ -42,4 +42,5 @@ jobs:
           maximize_build_space: true
 
           chunkah: true
+          build_opts: --chunkah-version v0.6.0
           use_cache: true
