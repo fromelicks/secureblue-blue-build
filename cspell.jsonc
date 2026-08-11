@@ -1,7 +1,21 @@
 {
     "words": [
+        "btmon",
         "copr",
         "flatpak",
         "flatpaks",
+        "ghostty",
+        "gschema",
+        "gsconnect",
+        "kargs",
+        "keepassxc",
+        "libomp",
+        "lldb",
+        "rclone",
+        "rootfs",
+        "sbcl",
+        "wezfurlong",
+        "wezterm",
+        "xpra"
     ]
 }
