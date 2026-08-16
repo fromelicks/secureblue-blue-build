@@ -3,6 +3,10 @@ Description=Capture Bluetooth HCI traffic for intermittent mouse disconnect diag
 Documentation=man:btmon(1)
 Wants=bluetooth.service
 After=bluetooth.service
+# Do not flood the journal indefinitely if a future image regression makes the
+# helper unexecutable or the Bluetooth controller remains unavailable.
+StartLimitIntervalSec=5min
+StartLimitBurst=10
 
 [Service]
 Type=simple
