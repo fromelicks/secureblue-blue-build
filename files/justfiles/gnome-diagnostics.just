@@ -135,3 +135,72 @@ disable-mutter-debug:
     rm -f "$DROPIN"
     systemctl --user daemon-reload
     echo "Mutter debug logging disabled."
+
+# Report whether each kernel-crash capture path is actually armed.
+[group('Diagnostics')]
+check-crash-capture:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "--- panic behaviour ---"
+    P=$(cat /proc/sys/kernel/panic)
+    if [ "$P" = "-1" ]; then
+        echo "kernel.panic = -1  ** reboots instantly; a panic leaves no readable message **"
+    else
+        echo "kernel.panic = $P seconds on screen before reboot"
+    fi
+    printf 'kernel.panic_on_oops = %s\n' "$(cat /proc/sys/kernel/panic_on_oops)"
+    echo ""
+    echo "--- ramoops (RAM-backed, survives warm reboot) ---"
+    if grep -q 'ramoops.mem_name' /proc/cmdline; then
+        echo "kargs:   $(grep -o 'reserve_mem=[^ ]*\|ramoops\.[^ ]*' /proc/cmdline | tr '\n' ' ')"
+    else
+        echo "kargs:   MISSING -- reserve_mem=/ramoops.mem_name= not on the command line"
+    fi
+    if [ -d /sys/module/ramoops ]; then
+        echo "module:  loaded"
+    else
+        echo "module:  NOT loaded"
+    fi
+    echo ""
+    echo "--- pstore ---"
+    echo "mount:   $(findmnt -no OPTIONS /sys/fs/pstore 2>/dev/null || echo 'not mounted')"
+    echo "efi:     pstore_disable=$(cat /sys/module/efi_pstore/parameters/pstore_disable 2>/dev/null || echo '?') (Y is expected; EFI NVRAM writes are deliberately avoided)"
+    echo ""
+    echo "--- firmware error records ---"
+    ls /sys/firmware/acpi/tables/ 2>/dev/null | grep -qE 'BERT' \
+        && echo "BERT:    present" \
+        || echo "BERT:    absent -- this firmware records no hardware error reports"
+    echo ""
+    echo "--- records on hand ---"
+    # /sys/fs/pstore is drwxr-x--- root:root, so an unprivileged ls returns
+    # nothing and would report "0 entr(ies)" whether or not a record exists --
+    # the exact false negative this check is meant to rule out. Count as root,
+    # and say so when the count could not be taken.
+    for d in /sys/fs/pstore /var/lib/systemd/pstore; do
+        if N=$(run0 -i find "$d" -type f 2>/dev/null | wc -l); then
+            printf '%-24s %s entr(ies)\n' "$d:" "$N"
+        else
+            printf '%-24s unreadable (needs root)\n' "$d:"
+        fi
+    done
+
+# Print any kernel crash record preserved from a previous boot.
+[group('Diagnostics')]
+show-crash-records:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    FOUND=0
+    for d in /sys/fs/pstore /var/lib/systemd/pstore; do
+        mapfile -t RECS < <(run0 -i find "$d" -type f 2>/dev/null | sort)
+        [ "${#RECS[@]}" -gt 0 ] || continue
+        FOUND=1
+        for r in "${RECS[@]}"; do
+            echo "════════ $r ════════"
+            run0 -i cat "$r"
+            echo ""
+        done
+    done
+    if [ "$FOUND" -eq 0 ]; then
+        echo "No crash records preserved."
+        echo "Run 'ujust check-crash-capture' to confirm capture is actually armed."
+    fi
