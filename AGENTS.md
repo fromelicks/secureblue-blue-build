@@ -52,6 +52,8 @@ touching the relevant subsystem.
 | Area | Doc | Summary |
 |---|---|---|
 | WiFi + S2Idle suspend | [`docs/wifi-s2idle-suspend.md`](docs/wifi-s2idle-suspend.md) | Intel CNVi 9560 enters D3cold on S2Idle resume → firmware NMI → device stuck in reset across warm reboots. Fix: udev rule + sleep hook setting `d3cold_allowed=0`. S2Idle vs S3 tradeoff documented there. |
+| Desktop freezes under load | [`docs/desktop-responsiveness.md`](docs/desktop-responsiveness.md) | The hardening kargs make `fork`+`exec` ~3.3 ms (vs 0.5–1 ms stock), so fork-heavy apps starve the compositor. Fix: `session.slice` ≫ `app.slice` CPU/IO weights, `io.cost` to make `IOWeight` work on NVMe, and a starvation classifier so the hang monitor stops mistaking overload for a wedged shell. |
+| GNOME hang detection | [`docs/gnome-hang-monitor.md`](docs/gnome-hang-monitor.md) | Continuous `org.gnome.Shell.Eval` probe with detached, bounded diagnostics and automatic session recovery. |
 
 ## Cross-cutting secureblue constraints (MUST be handled)
 

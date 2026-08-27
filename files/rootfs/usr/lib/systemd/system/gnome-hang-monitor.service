@@ -9,12 +9,38 @@ ExecStart=/usr/libexec/fromelicks-gnome-hang-monitor monitor
 Restart=always
 RestartSec=10s
 
-# Three failed Shell-owned D-Bus probes produce detailed snapshots before the
-# monitor terminates the hung shell and lets GDM recover the session.
+# The monitor must keep running and stay able to recover the session precisely
+# when the machine is too loaded for anything else to run. Without this it is
+# just another task on a saturated runqueue and its recovery never fires.
+Nice=-15
+CPUWeight=10000
+IOWeight=1000
+OOMScoreAdjust=-900
+
+# Three failed Shell-owned D-Bus probes produce a snapshot before the monitor
+# terminates the hung shell and lets GDM recover the session. Failures caused by
+# system-wide resource starvation are classified separately and never escalate
+# to killing the compositor.
 Environment=CHECK_INTERVAL_SECONDS=30
 Environment=PROBE_TIMEOUT_SECONDS=5
 Environment=FAILURE_LIMIT=3
 Environment=RECOVER_HUNG_SHELL=yes
+
+# Snapshots run detached from the check loop under this hard bound, so a slow
+# collection can no longer stretch the interval between health checks.
+Environment=SNAPSHOT_TIMEOUT_SECONDS=45
+
+# Starvation classifier thresholds. SPAWN_LATENCY is the wall time of one
+# fork+exec of /usr/bin/true; on this hardware an idle baseline is ~3 ms, and
+# during the 2026-08-26 incident even a plain runuser took seconds.
+Environment=SPAWN_LATENCY_THRESHOLD_MS=250
+Environment=PSI_CPU_SOME_THRESHOLD=90
+Environment=PSI_IO_FULL_THRESHOLD=60
+Environment=PSI_MEM_FULL_THRESHOLD=25
+
+# ${EPOCHREALTIME} renders its decimal separator per locale; the spawn-latency
+# probe parses it as an integer.
+Environment=LC_ALL=C
 
 RuntimeDirectory=gnome-diagnostics
 RuntimeDirectoryMode=0700
