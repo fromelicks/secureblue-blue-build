@@ -107,6 +107,14 @@ modules:
   - type: kargs
     kargs:
       - loglevel=4
+      # Crash capture. reserve_mem= declares a named 2 MiB region (kernel >= 6.14)
+      # and ramoops attaches to it by name, so no physical address is hard-coded.
+      # The panic dmesg survives a warm reboot in that RAM and systemd-pstore
+      # archives it to /var/lib/systemd/pstore on the next boot.
+      # See docs/crash-capture.md.
+      - reserve_mem=2M:4096:oops
+      - ramoops.mem_name=oops
+      - ramoops.ecc=1
 
   - type: justfiles
     validate: true

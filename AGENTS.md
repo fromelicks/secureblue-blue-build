@@ -54,6 +54,7 @@ touching the relevant subsystem.
 | WiFi + S2Idle suspend | [`docs/wifi-s2idle-suspend.md`](docs/wifi-s2idle-suspend.md) | Intel CNVi 9560 enters D3cold on S2Idle resume → firmware NMI → device stuck in reset across warm reboots. Fix: udev rule + sleep hook setting `d3cold_allowed=0`. S2Idle vs S3 tradeoff documented there. |
 | Desktop freezes under load | [`docs/desktop-responsiveness.md`](docs/desktop-responsiveness.md) | The hardening kargs make `fork`+`exec` ~3.3 ms (vs 0.5–1 ms stock), so fork-heavy apps starve the compositor. Fix: `session.slice` ≫ `app.slice` CPU/IO weights, `io.cost` to make `IOWeight` work on NVMe, and a starvation classifier so the hang monitor stops mistaking overload for a wedged shell. |
 | GNOME hang detection | [`docs/gnome-hang-monitor.md`](docs/gnome-hang-monitor.md) | Continuous `org.gnome.Shell.Eval` probe with detached, bounded diagnostics and automatic session recovery. |
+| Spontaneous instant reboots | [`docs/crash-capture.md`](docs/crash-capture.md) | secureblue's `kernel.panic=-1` reboots in zero seconds, EFI pstore is off, ramoops was unconfigured and this firmware has no BERT — so a panic left *no* evidence anywhere. Fix: `kernel.panic=30` override plus ramoops on a `reserve_mem=` named region. |
 
 ## Cross-cutting secureblue constraints (MUST be handled)
 
@@ -82,6 +83,46 @@ These gate multiple features. Verified against secureblue source.
    Electron apps (VSCode) need `--ozone-platform-hint=auto` for native Wayland.
 8. **hardened_malloc is globally preloaded.** Some apps (Steam) require it disabled per-app.
 9. Trivalent defaults WebRTC to disable_non_proxied_udp — breaks browser-based real-time voice/video (Discord, Meet, Jitsi); relax per-need or use a dedicated client.
+10. **secureblue's `kernel.panic=-1` makes crashes undiagnosable by default.**
+    `/usr/lib/sysctl.d/55-hardening.conf` reboots with *zero* delay on panic, so on a KMS
+    console a panic is a colour flash and nothing else. Combined with
+    `efi_pstore.pstore_disable=Y` (Fedora default), no ramoops region, and no `BERT`/`HEST`
+    tables on this firmware, every crash-capture path was closed — a real reboot on
+    2026-08-26 left no evidence at all. Overridden to `kernel.panic=30` in
+    `files/rootfs/etc/sysctl.d/99-fromelicks-panic-visibility.conf` — which wins on the
+    `99-` prefix, NOT on the directory: `sysctl.d(5)` sorts all files across `/etc`,
+    `/run` and `/usr/lib` by basename and takes the last, and `/etc` only overrides
+    `/usr/lib` for a file of the *same name*. Never renumber it below `55-`. Plus ramoops
+    on a `reserve_mem=` named region. Do NOT set `panic_on_oops=1` to "improve" this —
+    secureblue deliberately pairs `panic_on_oops=0` with `oops_limit=100`, and flipping it
+    converts survivable oopses into reboots.
+    **Expected consequence:** `ujust audit-secureblue` will now permanently fail its
+    "Ensuring no sysctl overrides" check with `kernel.panic should be -1, but is actually
+    30`. `audit_secureblue.py:audit_sysctl()` diffs every key of `55-hardening.conf`
+    against `/proc/sys`, and `audit_utils.validate_sysctl` has no special case for
+    `kernel.panic`, so it falls through to exact equality. That one line is the accepted
+    trade; any *other* sysctl finding in that check is real and must be investigated.
+    See [`docs/crash-capture.md`](docs/crash-capture.md).
+11. **`systemd.user.enabled` in the recipe enables units GLOBALLY**, via
+    `/etc/systemd/user/default.target.wants/`. GDM's greeter runs a full systemd user
+    manager (`user@60578.service`, user `gdm-greeter` — a dynamic user, see
+    `/var/lib/gdm/.migrated-dyn-users`), so every globally enabled user unit **also starts
+    in the greeter, before login**. This silently broke Syncthing: the greeter instance
+    generated its own device ID and held ports 22000/8384, so the real session could never
+    bind. Any user unit that binds a port, touches shared state, or should be per-login
+    needs a guard. `ConditionUser=!@system` is NOT enough (gdm-greeter's UID is 60578); use
+    the pair ublue uses on `user-flatpak-setup.service`:
+    `ConditionUser=!@system` + `ConditionPathIsDirectory=/var/home/%u`.
+    Applied in `files/rootfs/usr/lib/systemd/user/syncthing.service.d/10-skip-greeter.conf`.
+12. **The `linuxbrew` account is deliberately unusable via PAM.** `sysusers.d` creates it
+    with the `u!` (locked) modifier, which sets a locked password *and* an expiry date of
+    1970-01-02. Anything that opens a PAM session as `linuxbrew` — `run0 -u linuxbrew`
+    (as brew-proxy's README suggests), `su`, `login` — fails with
+    `PAM failed: User account has expired`. This is by design. The supported paths bypass
+    PAM: the `/usr/bin/brew` shim → `brew-proxy` DBus service, and the
+    `brew-update`/`brew-upgrade` units via `User=linuxbrew`. Use `ujust brew-shell`
+    (systemd-run, no PAM) if a real linuxbrew shell is ever needed; `ujust check-brew`
+    reports the state.
 
 ## Feature implementation plan
 
