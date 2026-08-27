@@ -80,6 +80,26 @@ These gate multiple features. Verified against secureblue source.
    Electron apps (VSCode) need `--ozone-platform-hint=auto` for native Wayland.
 8. **hardened_malloc is globally preloaded.** Some apps (Steam) require it disabled per-app.
 9. Trivalent defaults WebRTC to disable_non_proxied_udp — breaks browser-based real-time voice/video (Discord, Meet, Jitsi); relax per-need or use a dedicated client.
+11. **`systemd.user.enabled` in the recipe enables units GLOBALLY**, via
+    `/etc/systemd/user/default.target.wants/`. GDM's greeter runs a full systemd user
+    manager (`user@60578.service`, user `gdm-greeter` — a dynamic user, see
+    `/var/lib/gdm/.migrated-dyn-users`), so every globally enabled user unit **also starts
+    in the greeter, before login**. This silently broke Syncthing: the greeter instance
+    generated its own device ID and held ports 22000/8384, so the real session could never
+    bind. Any user unit that binds a port, touches shared state, or should be per-login
+    needs a guard. `ConditionUser=!@system` is NOT enough (gdm-greeter's UID is 60578); use
+    the pair ublue uses on `user-flatpak-setup.service`:
+    `ConditionUser=!@system` + `ConditionPathIsDirectory=/var/home/%u`.
+    Applied in `files/rootfs/usr/lib/systemd/user/syncthing.service.d/10-skip-greeter.conf`.
+12. **The `linuxbrew` account is deliberately unusable via PAM.** `sysusers.d` creates it
+    with the `u!` (locked) modifier, which sets a locked password *and* an expiry date of
+    1970-01-02. Anything that opens a PAM session as `linuxbrew` — `run0 -u linuxbrew`
+    (as brew-proxy's README suggests), `su`, `login` — fails with
+    `PAM failed: User account has expired`. This is by design. The supported paths bypass
+    PAM: the `/usr/bin/brew` shim → `brew-proxy` DBus service, and the
+    `brew-update`/`brew-upgrade` units via `User=linuxbrew`. Use `ujust brew-shell`
+    (systemd-run, no PAM) if a real linuxbrew shell is ever needed; `ujust check-brew`
+    reports the state.
 
 ## Feature implementation plan
 
