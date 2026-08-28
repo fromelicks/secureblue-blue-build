@@ -14,8 +14,21 @@ is deadlocked therefore fails the check. Evaluation is disabled in the
 hardened production session and normally returns `false`; receiving that reply
 still proves that Shell dispatched the method.
 
-For each consecutive failure, the monitor records a full snapshot under the
-`gnome-diagnostics` journal identifier:
+A failed probe only proves that no reply arrived within the timeout, which also
+happens when the machine is too contended to schedule the probe at all. Before
+acting, the monitor classifies the machine as `starved` or `responsive` using
+the wall time of one `fork`+`exec` plus the PSI files under `/proc/pressure`.
+A starved tick is logged and snapshotted but **never** counted towards the
+failure limit, so a system-wide overload cannot cause the compositor to be
+killed. It does not *clear* the count either: on an intermittently loaded
+machine, ticks alternating starved and responsive would otherwise keep resetting
+the counter and a genuinely wedged shell could never reach the limit. A starved
+tick does not count; it does not forgive the ticks that did. See [`desktop-responsiveness.md`](desktop-responsiveness.md) for the
+thresholds and the resource-priority settings that reduce starvation in the
+first place.
+
+For each consecutive failure that is *not* attributable to starvation, the
+monitor records a snapshot under the `gnome-diagnostics` journal identifier:
 
 - GNOME Shell process and per-thread state, kernel wait channels, syscalls, and
   kernel stacks;
@@ -24,10 +37,33 @@ For each consecutive failure, the monitor records a full snapshot under the
 - DRM cards, connector state, runtime power state, and bounded `nvidia-smi`
   output;
 - every process holding a DRM device, including its SELinux domain and DRM
-  client/engine/memory accounting from `/proc/*/fdinfo`;
+  client/engine/memory accounting from `/proc/*/fdinfo` (bounded to 20 seconds
+  and 4000 processes);
 - recent display, suspend/resume, and SELinux denial events from the system
   journal;
 - recent kernel warnings and user-session logs.
+
+Snapshots run **detached from the check loop**, reniced to +19, one at a time,
+and the loop sleeps to the next wall-clock tick boundary (with a 5 s floor). A
+slow collection therefore cannot delay recovery, which was the defect that
+prevented recovery during the 2026-08-26 incident.
+
+Routine collections are bounded by `SNAPSHOT_TIMEOUT_SECONDS` (25 s) plus a 3 s
+`timeout -k` grace — 28 s of worst-case slot occupancy, below the 30 s check
+interval, so one can never still occupy the single in-flight slot when the next
+tick needs it. The script clamps the budget to `CHECK_INTERVAL_SECONDS` minus
+the grace rather than trusting the unit: a stale `45` override in the unit file
+silently dropped the second snapshot of every failure ladder, which is the rung
+that shows whether a hang is progressing. The pre-recovery collection is the
+exception: it **pre-empts** whatever is in flight and gets
+`FULL_SNAPSHOT_TIMEOUT_SECONDS` (60 s), because it is the last chance to capture
+this compositor before it is signalled.
+
+Per-thread wait channels, syscalls and kernel stacks are captured at *every*
+detail level — they are plain `/proc` reads. Only `eu-stack` and the system-wide
+DRM client walk are reserved for `full`, which is used on the attempt that
+triggers recovery. A hang that resolves on its own before the limit therefore
+still leaves enough to find where the main loop was blocked.
 
 After three failed checks, it sends `SIGCONT` followed by `SIGTERM` to the same
 validated GNOME Shell PID. This lets GDM recover the graphical session without
@@ -54,6 +90,29 @@ The monitor pauses while the system sleep hook is active. The sleep hook still
 captures immediate pre-suspend and post-resume state, but no longer launches a
 background watchdog process.
 
+## Service sandboxing
+
+The unit runs as root and keeps exactly four capabilities — `CAP_SYS_PTRACE`,
+`CAP_KILL`, `CAP_DAC_READ_SEARCH` and `CAP_SETUID`/`CAP_SETGID` — because it has
+to unwind another user's compositor threads and signal that compositor from
+outside the session. Everything else that costs it nothing is switched on, which
+puts `systemd-analyze security` at **4.1 OK**.
+
+Four of that tool's remaining suggestions are **deliberately not applied**, and
+the unit file says so inline. The dangerous one is `ProcSubset=pid`: it hides
+every non-process `/proc` file, including `/proc/pressure/*`. That is the whole
+starvation classifier, and without PSI the monitor cannot tell an overloaded
+machine from a wedged compositor — so it would treat overload as a hang and kill
+GNOME Shell, which is the precise failure this service exists to prevent. The
+others: `ProtectProc=` at anything but `default` hides other users' processes
+(the entire job), `PrivateUsers=` breaks the `runuser` calls, and
+`SystemCallFilter=@system-service` excludes `@debug` and so breaks every
+`eu-stack` backtrace.
+
+Treat the exposure number as a checklist, never a target. This service is
+supposed to be privileged; the value of the tool here is the rows that are free,
+not the score.
+
 ## Operator commands
 
 ```bash
@@ -61,6 +120,8 @@ just check-gnome-health
 just status-gnome-hang-monitor
 just show-resume-diagnostics
 just collect-gnome-diag
+just check-system-load        # starved vs. merely busy, with the evidence
+just collect-starvation-diag  # who is consuming the machine right now
 ```
 
 Older deployments may retain the former runtime hook at

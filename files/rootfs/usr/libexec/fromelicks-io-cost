@@ -1,0 +1,84 @@
+#!/bin/bash
+# Enable the cgroup v2 io.cost controller so IOWeight= actually takes effect.
+#
+# NVMe devices default to the "none" I/O scheduler, where io.weight is inert and
+# every IOWeight= setting silently does nothing. io.cost works below the
+# scheduler by modelling device capacity, so weights apply on multi-queue NVMe
+# without the throughput cost of switching to bfq. "ctrl=auto" lets the kernel
+# calibrate the model against the real device instead of a static guess.
+#
+# Enabling this is what makes the IOWeight= values in the session/app/background
+# slice drop-ins meaningful.
+
+set -u
+
+TAG=fromelicks-io-cost
+CGROUP_ROOT=/sys/fs/cgroup
+
+log_info() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p info; }
+log_warn() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p warning; }
+
+# Emit "MAJ:MIN name" for every whole-disk, non-removable, non-virtual device.
+list_physical_disks() {
+  local dev name devno removable
+  for dev in /sys/block/*; do
+    [ -d "$dev/queue" ] || continue
+    name=${dev##*/}
+    case "$name" in
+      loop*|ram*|zram*|dm-*|md*|sr*|fd*) continue ;;
+    esac
+    # Devices without a "device" link are virtual (zram, device-mapper, ...).
+    [ -e "$dev/device" ] || continue
+    read -r removable < "$dev/removable" 2>/dev/null || removable=0
+    [ "$removable" = "0" ] || continue
+    read -r devno < "$dev/dev" 2>/dev/null || continue
+    printf '%s %s\n' "$devno" "$name"
+  done
+}
+
+apply() {
+  local state="$1" devno name applied=0
+
+  if [ ! -w "$CGROUP_ROOT/io.cost.qos" ]; then
+    log_warn "io.cost is unavailable (no $CGROUP_ROOT/io.cost.qos); IOWeight= will have no effect"
+    return 0
+  fi
+
+  while read -r devno name; do
+    [ -n "$devno" ] || continue
+    if [ "$state" = "1" ]; then
+      # Calibrate the cost model against the device before enabling QoS control.
+      if ! printf '%s ctrl=auto\n' "$devno" > "$CGROUP_ROOT/io.cost.model" 2>/dev/null; then
+        log_warn "could not set io.cost model for $name ($devno)"
+        continue
+      fi
+    fi
+    if printf '%s enable=%s ctrl=auto\n' "$devno" "$state" > "$CGROUP_ROOT/io.cost.qos" 2>/dev/null; then
+      applied=$((applied + 1))
+      log_info "io.cost enable=$state on $name ($devno)"
+    else
+      log_warn "could not set io.cost qos for $name ($devno)"
+    fi
+  done < <(list_physical_disks)
+
+  if [ "$applied" -eq 0 ]; then
+    log_warn "io.cost was not applied to any device; IOWeight= will have no effect"
+  fi
+}
+
+case "${1:-enable}" in
+  enable) apply 1 ;;
+  disable) apply 0 ;;
+  status)
+    echo "--- io.cost.qos ---"
+    cat "$CGROUP_ROOT/io.cost.qos" 2>/dev/null || echo "(unavailable)"
+    echo "--- io.cost.model ---"
+    cat "$CGROUP_ROOT/io.cost.model" 2>/dev/null || echo "(unavailable)"
+    echo "--- physical disks ---"
+    list_physical_disks
+    ;;
+  *)
+    echo "usage: $0 {enable|disable|status}" >&2
+    exit 2
+    ;;
+esac

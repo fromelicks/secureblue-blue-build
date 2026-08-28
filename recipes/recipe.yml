@@ -80,6 +80,7 @@ modules:
     system:
       enabled:
         - btmon-capture.service
+        - fromelicks-io-cost.service
         - gnome-hang-monitor.service
         - netbird.service
     user:

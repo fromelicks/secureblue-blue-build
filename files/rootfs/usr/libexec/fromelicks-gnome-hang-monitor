@@ -8,15 +8,56 @@
 
 set -u
 
+# ${EPOCHREALTIME} renders its decimal separator per locale and the spawn
+# latency probe parses it as an integer.
+export LC_ALL=C
+
 TAG=gnome-diagnostics
 RUNDIR=/run/gnome-diagnostics
 SLEEP_MARKER=$RUNDIR/system-sleep-active
+SELF=/usr/libexec/fromelicks-gnome-hang-monitor
 
 CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-30}
 PROBE_TIMEOUT_SECONDS=${PROBE_TIMEOUT_SECONDS:-5}
 FAILURE_LIMIT=${FAILURE_LIMIT:-3}
 RECOVER_HUNG_SHELL=${RECOVER_HUNG_SHELL:-yes}
 RECOVERY_DISABLE_FILE=$RUNDIR/no-recovery
+
+# Snapshots run detached from the check loop under this hard bound. A collection
+# that outlives it is killed rather than allowed to delay the next health check.
+# Routine snapshots must finish inside one check interval, or a collection
+# started on one tick is still holding the single in-flight slot on the next and
+# the newer request is dropped. The pre-recovery snapshot is the exception: it
+# gets a longer budget and pre-empts, because after recovery the loop stops
+# probing the old PID anyway, so it cannot delay anything.
+SNAPSHOT_TIMEOUT_SECONDS=${SNAPSHOT_TIMEOUT_SECONDS:-25}
+FULL_SNAPSHOT_TIMEOUT_SECONDS=${FULL_SNAPSHOT_TIMEOUT_SECONDS:-60}
+MIN_TICK_SLEEP_SECONDS=${MIN_TICK_SLEEP_SECONDS:-5}
+
+# timeout(1) sends TERM at the budget and KILL this much later, so real slot
+# occupancy is budget + grace. A collection wedged in an uninterruptible /proc
+# read is precisely the case where the grace gets used, and precisely the case
+# where the machine is sick enough that the next tick matters.
+SNAPSHOT_KILL_GRACE_SECONDS=3
+FULL_SNAPSHOT_KILL_GRACE_SECONDS=10
+
+# Enforce the single-slot invariant here rather than trusting whoever set the
+# environment: this exact drift (a stale 45 s override against a 30 s interval)
+# silently disabled the second snapshot of every failure ladder. Leave a tick's
+# worth of margin so a collection dispatched mid-tick still clears the slot.
+if [ "$SNAPSHOT_TIMEOUT_SECONDS" -gt \
+     "$((CHECK_INTERVAL_SECONDS - SNAPSHOT_KILL_GRACE_SECONDS - 2))" ]; then
+  SNAPSHOT_TIMEOUT_SECONDS=$((CHECK_INTERVAL_SECONDS - SNAPSHOT_KILL_GRACE_SECONDS - 2))
+  [ "$SNAPSHOT_TIMEOUT_SECONDS" -ge 5 ] || SNAPSHOT_TIMEOUT_SECONDS=5
+fi
+
+# Starvation classifier. A failed probe means "the compositor did not answer",
+# which is also what a machine too loaded to schedule anything looks like.
+# These decide which of the two it was.
+SPAWN_LATENCY_THRESHOLD_MS=${SPAWN_LATENCY_THRESHOLD_MS:-250}
+PSI_CPU_SOME_THRESHOLD=${PSI_CPU_SOME_THRESHOLD:-90}
+PSI_IO_FULL_THRESHOLD=${PSI_IO_FULL_THRESHOLD:-60}
+PSI_MEM_FULL_THRESHOLD=${PSI_MEM_FULL_THRESHOLD:-25}
 
 log_info() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p info; }
 log_warn() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p warning; }
@@ -119,8 +160,96 @@ print_proc_file() {
   fi
 }
 
+# ── system-wide starvation detection ───────────────────────────────────────
+#
+# A failed health probe only proves that no reply arrived within the timeout.
+# That happens both when the compositor's main loop is wedged and when the
+# machine is too contended to schedule the probe itself. The two need opposite
+# responses: killing GNOME Shell recovers the first and merely destroys a
+# working session during the second, so classify before acting.
+
+# Pressure Stall Information, as an integer percentage of the last 10 seconds.
+# $1 = cpu|io|memory, $2 = some|full. Prints 0 when PSI is unavailable.
+psi_avg10() {
+  local kind="$2" path="/proc/pressure/$1" value=""
+
+  if [ -r "$path" ]; then
+    # Lines read: "some avg10=0.00 avg60=0.00 avg300=0.00 total=0".
+    # Truncate rather than round, so a threshold of N means "at least N".
+    value=$(awk -v kind="$kind" '
+      $1 == kind {
+        for (i = 2; i <= NF; i++) {
+          if (index($i, "avg10=") == 1) {
+            split($i, kv, "=")
+            printf "%d", kv[2] + 0
+            exit
+          }
+        }
+      }' "$path" 2>/dev/null)
+  fi
+
+  case "${value:-}" in
+    ''|*[!0-9]*) printf '0\n' ;;
+    *) printf '%s\n' "$value" ;;
+  esac
+}
+
+# Wall time of a single fork+exec, in milliseconds. This measures the exact
+# thing that collapsed during the 2026-08-26 incident: process creation on a
+# saturated machine. It is also the cheapest honest probe available -- two
+# forks -- and unlike PSI it reflects slab, I/O and lock contention too.
+spawn_latency_ms() {
+  local i start end a b c m
+  # Median of three, not a single sample: one scheduling outlier must not be
+  # able to declare the machine starved on its own, and one lucky sample must
+  # not mask sustained contention. Sorted inline because forking sort(1) here
+  # would perturb the very thing being measured.
+  for i in 0 1 2; do
+    start=${EPOCHREALTIME/./}
+    /usr/bin/true 2>/dev/null
+    end=${EPOCHREALTIME/./}
+    case "$start$end" in
+      *[!0-9]*) printf '0\n'; return 0 ;;
+    esac
+    m=$(( (end - start) / 1000 ))
+    case "$i" in 0) a=$m ;; 1) b=$m ;; 2) c=$m ;; esac
+  done
+  if [ "$a" -gt "$b" ]; then m=$a; a=$b; b=$m; fi
+  if [ "$b" -gt "$c" ]; then b=$c; fi
+  if [ "$a" -gt "$b" ]; then b=$a; fi
+  printf '%d\n' "$b"
+}
+
+# Prints "starved" or "responsive", followed by the evidence that decided it.
+classify_system_load() {
+  local latency cpu_some io_full mem_full verdict=responsive reason=""
+
+  latency=$(spawn_latency_ms)
+  cpu_some=$(psi_avg10 cpu some)
+  io_full=$(psi_avg10 io full)
+  mem_full=$(psi_avg10 memory full)
+
+  if [ "$latency" -ge "$SPAWN_LATENCY_THRESHOLD_MS" ]; then
+    verdict=starved
+    reason="fork+exec took ${latency}ms (threshold ${SPAWN_LATENCY_THRESHOLD_MS}ms)"
+  elif [ "$cpu_some" -ge "$PSI_CPU_SOME_THRESHOLD" ]; then
+    verdict=starved
+    reason="cpu pressure some avg10=${cpu_some}% (threshold ${PSI_CPU_SOME_THRESHOLD}%)"
+  elif [ "$io_full" -ge "$PSI_IO_FULL_THRESHOLD" ]; then
+    verdict=starved
+    reason="io pressure full avg10=${io_full}% (threshold ${PSI_IO_FULL_THRESHOLD}%)"
+  elif [ "$mem_full" -ge "$PSI_MEM_FULL_THRESHOLD" ]; then
+    verdict=starved
+    reason="memory pressure full avg10=${mem_full}% (threshold ${PSI_MEM_FULL_THRESHOLD}%)"
+  else
+    reason="spawn=${latency}ms cpu_some=${cpu_some}% io_full=${io_full}% mem_full=${mem_full}%"
+  fi
+
+  printf '%s %s\n' "$verdict" "$reason"
+}
+
 collect_thread_state() {
-  local pid="$1" task tid comm fd target
+  local pid="$1" detail="${2:-standard}" task tid comm fd target
 
   echo "--- gnome-shell threads ---"
   ps -L -p "$pid" -o pid,tid,psr,stat,wchan:40,pcpu,comm 2>&1 || true
@@ -152,6 +281,13 @@ collect_thread_state() {
   echo "--- gnome-shell memory map ---"
   print_proc_file "/proc/$pid/maps"
 
+  # eu-stack is the only expensive part of this function -- it stops the target
+  # to unwind it -- so it is the only part gated on full detail. wchan, syscall
+  # and the kernel stacks are plain /proc reads and identify where the main loop
+  # is blocked, which is exactly what a hang that self-resolves needs recorded.
+  if [ "$detail" != "full" ]; then
+    return 0
+  fi
   echo "--- gnome-shell userspace stacks (eu-stack, 15s limit) ---"
   if command -v eu-stack >/dev/null 2>&1; then
     timeout -k 2s 15s eu-stack -p "$pid" 2>&1 || echo "(eu-stack failed or timed out)"
@@ -212,11 +348,20 @@ collect_drm_state() {
 
 collect_drm_clients() {
   local proc pid client_fd detail_fd fd_number target key comm uid context
+  local deadline=$((SECONDS + 20)) scanned=0
   declare -A seen=()
 
-  echo "--- processes with open DRM devices ---"
+  # This walks every process and readlinks every descriptor. On a machine that
+  # is spawning thousands of processes a second -- the exact situation that
+  # produces a hang worth diagnosing -- an unbounded walk never terminates.
+  echo "--- processes with open DRM devices (bounded: 20s / 4000 processes) ---"
   for proc in /proc/[0-9]*; do
     [ -d "$proc/fd" ] || continue
+    scanned=$((scanned + 1))
+    if [ "$scanned" -gt 4000 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      echo "(scan truncated after $scanned processes)"
+      break
+    fi
     pid=${proc##*/}
     for client_fd in "$proc"/fd/[0-9]*; do
       [ -e "$client_fd" ] || continue
@@ -244,6 +389,141 @@ collect_drm_clients() {
   done
 }
 
+# Snapshot for the "the whole machine is starved" case. Deliberately disjoint
+# from collect_state: what matters here is who is consuming the machine, not
+# what GNOME Shell's threads are doing.
+collect_starvation_state() {
+  local label="$1" reason="${2:-}" lookback="${3:-180}"
+  local forks_before forks_after since resource slice base
+
+  since=$(seconds_ago "$lookback")
+
+  {
+    echo "=== $label at $(date -Iseconds) ==="
+    echo "verdict: system-wide resource starvation"
+    echo "evidence: ${reason:-none}"
+    echo "boot_id: $(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    echo "uptime: $(cat /proc/uptime 2>/dev/null || true)"
+    echo "loadavg: $(cat /proc/loadavg 2>/dev/null || true)"
+    echo "spawn_latency_ms: $(spawn_latency_ms)"
+
+    echo "--- pressure stall information ---"
+    for resource in cpu io memory irq; do
+      printf '[%s]\n' "$resource"
+      print_proc_file "/proc/pressure/$resource"
+    done
+
+    # Process creation rate. This is the signal that identified the 2026-08-26
+    # incident: ~20000 processes in 150 seconds from an editor's git integration.
+    forks_before=$(awk '/^processes / { print $2; exit }' /proc/stat 2>/dev/null || echo 0)
+    sleep 2
+    forks_after=$(awk '/^processes / { print $2; exit }' /proc/stat 2>/dev/null || echo 0)
+    echo "--- process creation rate ---"
+    echo "forks_per_second: $(( (forks_after - forks_before) / 2 ))"
+    echo "procs_running_blocked: $(awk '/^procs_running|^procs_blocked/ { printf "%s=%s ", $1, $2 }' /proc/stat 2>/dev/null)"
+
+    echo "--- memory ---"
+    head -n 8 /proc/meminfo 2>/dev/null || true
+    echo "swap: $(swapon --show=NAME,USED --noheadings 2>/dev/null | tr '\n' ' ')"
+
+    echo "--- top control groups by CPU (5s limit) ---"
+    timeout -k 2s 5s systemd-cgtop --batch --iterations=2 --delay=1s \
+      --order=cpu --depth=4 2>/dev/null | tail -n 30 || echo "(systemd-cgtop failed or timed out)"
+
+    echo "--- top processes by CPU ---"
+    timeout -k 2s 5s ps -eo pid,ppid,uid,ni,pcpu,pmem,rss,stat,wchan:24,comm \
+      --sort=-pcpu 2>/dev/null | head -n 25 || echo "(ps failed or timed out)"
+
+    echo "--- top processes by RSS ---"
+    timeout -k 2s 5s ps -eo pid,ppid,uid,pcpu,pmem,rss,stat,comm \
+      --sort=-rss 2>/dev/null | head -n 15 || echo "(ps failed or timed out)"
+
+    echo "--- tasks in uninterruptible sleep ---"
+    timeout -k 2s 5s ps -eo pid,stat,wchan:32,comm 2>/dev/null \
+      | awk 'NR == 1 || $2 ~ /D/' | head -n 25 || echo "(ps failed or timed out)"
+
+    echo "--- session vs application slice accounting ---"
+    for slice in session.slice app.slice background.slice; do
+      for base in /sys/fs/cgroup/user.slice/user-*.slice/user@*.service; do
+        [ -d "$base/$slice" ] || continue
+        printf '[%s/%s]\n' "${base##*/}" "$slice"
+        printf 'cpu.weight='
+        print_proc_file "$base/$slice/cpu.weight"
+        printf 'io.weight='
+        print_proc_file "$base/$slice/io.weight"
+        echo "cpu.stat:"
+        head -n 3 "$base/$slice/cpu.stat" 2>/dev/null || echo "(unavailable)"
+        echo "cpu.pressure:"
+        print_proc_file "$base/$slice/cpu.pressure"
+      done
+    done
+
+    echo "--- recent kernel warnings ---"
+    timeout -k 2s 10s journalctl -b -k --since "$since" -p warning..alert --no-pager 2>/dev/null || true
+  } | systemd-cat -t "$TAG" -p warning
+}
+
+# Run a snapshot detached from the check loop and under a hard time bound.
+#
+# The previous implementation called collect_state synchronously before the
+# failure-limit check, so on a starved machine a single collection could take
+# minutes and push recovery far past the intended FAILURE_LIMIT * interval.
+# Only one snapshot may be in flight; a second request is dropped rather than
+# queued, because the machine is already short of resources.
+SNAPSHOT_PID=""
+
+snapshot_in_flight() {
+  [ -n "$SNAPSHOT_PID" ] || return 1
+  if kill -0 "$SNAPSHOT_PID" 2>/dev/null; then
+    return 0
+  fi
+  wait "$SNAPSHOT_PID" 2>/dev/null || true
+  SNAPSHOT_PID=""
+  return 1
+}
+
+# The check loop needs Nice=-15 to be scheduled during the very event it
+# watches for. The collector does not: it runs ps, journalctl, systemd-cgtop and
+# a /proc walk, and inherits that priority from the service cgroup. Renice it
+# back down so diagnostics never outbid the compositor they exist to protect.
+# This reorders competition inside the service's cgroup, which is where the
+# collector's cost actually lands; the cgroup's own CPUWeight still applies.
+snapshot_nice_prefix() {
+  # nice(1) is relative to the caller, so from -15 this clamps to +19.
+  if ionice -c 3 true 2>/dev/null; then
+    printf '%s\n' nice -n 34 ionice -c 3
+  else
+    printf '%s\n' nice -n 34
+  fi
+}
+
+run_snapshot_detached() {
+  local preempt=no nice_prefix
+  local budget="$SNAPSHOT_TIMEOUT_SECONDS" grace="$SNAPSHOT_KILL_GRACE_SECONDS"
+  if [ "${1:-}" = "--preempt" ]; then
+    preempt=yes
+    budget="$FULL_SNAPSHOT_TIMEOUT_SECONDS"
+    grace="$FULL_SNAPSHOT_KILL_GRACE_SECONDS"
+    shift
+  fi
+  if snapshot_in_flight; then
+    if [ "$preempt" != yes ]; then
+      log_warn "monitor: snapshot $SNAPSHOT_PID still running; skipping this collection"
+      return 0
+    fi
+    # The pre-recovery snapshot is the last chance to capture this compositor
+    # before it is signalled, so it displaces a routine collection rather than
+    # being dropped by the in-flight guard.
+    log_warn "monitor: pre-empting in-flight snapshot $SNAPSHOT_PID for the pre-recovery collection"
+    kill -TERM "$SNAPSHOT_PID" 2>/dev/null || true
+    wait "$SNAPSHOT_PID" 2>/dev/null || true
+    SNAPSHOT_PID=""
+  fi
+  mapfile -t nice_prefix < <(snapshot_nice_prefix)
+  "${nice_prefix[@]}" timeout -k "${grace}s" "${budget}s" "$SELF" "$@" &
+  SNAPSHOT_PID=$!
+}
+
 collect_state() {
   local label="$1" uid="${2:-}" pid="${3:-}" lookback="${4:-120}" detail="${5:-standard}"
   local user="" since
@@ -261,6 +541,19 @@ collect_state() {
     echo "uid: ${uid:-none}"
     echo "user: ${user:-none}"
     echo "gnome_pid: ${pid:-none}"
+    # Compositor state first. Everything below it can block for seconds on a
+    # starved machine (systemd-inhibit and the runuser round-trip each have a
+    # 5s timeout that routinely elapses), and the pre-recovery snapshot only has
+    # a two-second head start before SIGTERM lands -- so anything ordered after
+    # that preamble would capture a process already tearing down, not a hung one.
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+      echo "--- gnome-shell process status ---"
+      print_proc_file "/proc/$pid/status"
+      echo "--- gnome-shell limits ---"
+      print_proc_file "/proc/$pid/limits"
+      collect_thread_state "$pid" "$detail"
+    fi
+
     echo "--- login sessions ---"
     loginctl list-sessions --no-legend 2>/dev/null || true
     echo "--- inhibitors ---"
@@ -277,32 +570,21 @@ collect_state() {
         2>/dev/null || true
     fi
 
-    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
-      echo "--- gnome-shell process status ---"
-      print_proc_file "/proc/$pid/status"
-      echo "--- gnome-shell limits ---"
-      print_proc_file "/proc/$pid/limits"
-      if [ "$detail" = "full" ]; then
-        collect_thread_state "$pid"
-      else
-        echo "--- gnome-shell thread summary ---"
-        ps -L -p "$pid" -o pid,tid,psr,stat,wchan:40,pcpu,comm 2>&1 || true
-      fi
-    fi
-
     collect_drm_state
     if [ "$detail" = "full" ]; then
       collect_drm_clients
     fi
+    # Bounded: journalctl can block for a long time on a contended disk, and
+    # these run last, inside the outer snapshot timeout.
     echo "--- recent display, sleep, and SELinux events ---"
-    journalctl -b --since "$since" --no-pager -n 240 \
+    timeout -k 2s 10s journalctl -b --since "$since" --no-pager -n 240 \
       --grep='drmModeAtomicCommit|NVRM: Xid|i915.*(hang|reset)|PrepareForSleep|PM: suspend|PM: resume|USER_AVC|avc:.*denied' \
       2>/dev/null || true
     echo "--- recent kernel warnings ---"
-    journalctl -b -k --since "$since" -p warning..alert --no-pager 2>/dev/null || true
+    timeout -k 2s 10s journalctl -b -k --since "$since" -p warning..alert --no-pager 2>/dev/null || true
     if [ -n "$uid" ]; then
       echo "--- recent user journal ---"
-      journalctl -b --since "$since" _UID="$uid" --no-pager -n 120 2>/dev/null || true
+      timeout -k 2s 10s journalctl -b --since "$since" _UID="$uid" --no-pager -n 120 2>/dev/null || true
     fi
   } | systemd-cat -t "$TAG" -p warning
 }
@@ -327,17 +609,38 @@ recover_shell() {
   kill -TERM "$live_pid" 2>/dev/null || true
 }
 
+# Sleep until the next tick boundary rather than for a fixed duration, so the
+# time spent probing can never stretch the interval between health checks.
+wait_for_next_tick() {
+  local deadline="$1" now remaining
+  now=$(date +%s 2>/dev/null) || now=0
+  remaining=$((deadline - now))
+  # Always yield the CPU. A tick that overran its own interval would otherwise
+  # sleep zero and spin at Nice=-15/CPUWeight=10000, actively worsening the
+  # starvation it exists to detect. The upper clamp catches a failed date(1),
+  # which would otherwise compute a sleep of ~1.8 billion seconds.
+  if [ "$remaining" -lt "$MIN_TICK_SLEEP_SECONDS" ] ||
+     [ "$remaining" -gt "$CHECK_INTERVAL_SECONDS" ]; then
+    remaining=$MIN_TICK_SLEEP_SECONDS
+  fi
+  sleep "$remaining"
+}
+
 monitor_loop() {
-  local uid pid tracked_pid="" failures=0
+  local uid pid tracked_pid="" failures=0 starved_ticks=0
+  local verdict reason classification detail deadline
 
   mkdir -p "$RUNDIR"
-  log_info "monitor: started (interval=${CHECK_INTERVAL_SECONDS}s timeout=${PROBE_TIMEOUT_SECONDS}s failures=${FAILURE_LIMIT} recovery=${RECOVER_HUNG_SHELL})"
+  log_info "monitor: started (interval=${CHECK_INTERVAL_SECONDS}s timeout=${PROBE_TIMEOUT_SECONDS}s failures=${FAILURE_LIMIT} recovery=${RECOVER_HUNG_SHELL} snapshot_timeout=${SNAPSHOT_TIMEOUT_SECONDS}s)"
   trap 'log_info "monitor: stopped"; exit 0' TERM INT
 
   while true; do
+    deadline=$(( $(date +%s 2>/dev/null || echo 0) + CHECK_INTERVAL_SECONDS ))
+
     if [ -e "$SLEEP_MARKER" ]; then
       failures=0
-      sleep "$CHECK_INTERVAL_SECONDS"
+      starved_ticks=0
+      wait_for_next_tick "$deadline"
       continue
     fi
 
@@ -351,58 +654,113 @@ monitor_loop() {
       fi
       tracked_pid=""
       failures=0
-      sleep "$CHECK_INTERVAL_SECONDS"
+      starved_ticks=0
+      wait_for_next_tick "$deadline"
       continue
     fi
 
     if [ "$pid" != "$tracked_pid" ]; then
       tracked_pid="$pid"
       failures=0
+      starved_ticks=0
       log_info "monitor: tracking gnome-shell PID $pid for UID $uid"
       # Allow a newly started shell to acquire its D-Bus name before probing.
-      sleep "$CHECK_INTERVAL_SECONDS"
+      wait_for_next_tick "$deadline"
       continue
     fi
 
     if probe_gnome_shell_main_loop "$uid"; then
-      if [ "$failures" -gt 0 ]; then
-        log_info "monitor: gnome-shell PID $pid recovered after $failures health failure(s)"
+      if [ "$failures" -gt 0 ] || [ "$starved_ticks" -gt 0 ]; then
+        log_info "monitor: gnome-shell PID $pid responded again after $failures shell failure(s) and $starved_ticks starved tick(s)"
       fi
       failures=0
-    else
-      # systemd freezes the user slice before invoking system-sleep hooks. A
-      # probe already in flight can therefore time out after suspend has begun.
-      # Do not count or diagnose that expected failure once the hook's marker
-      # is visible.
-      if [ -e "$SLEEP_MARKER" ]; then
-        if [ "$failures" -gt 0 ]; then
-          log_info "monitor: discarding pending health failures because system sleep began"
-        fi
-        failures=0
-        sleep "$CHECK_INTERVAL_SECONDS"
-        continue
-      fi
-
-      failures=$((failures + 1))
-      log_warn "monitor: gnome-shell PID $pid unresponsive (attempt $failures/$FAILURE_LIMIT)"
-      collect_state \
-        "gnome-shell unresponsive attempt $failures/$FAILURE_LIMIT" \
-        "$uid" "$pid" 180 full
-
-      if [ "$failures" -ge "$FAILURE_LIMIT" ]; then
-        # A suspend can begin while the full diagnostic snapshot is running.
-        # Recheck immediately before taking any recovery action.
-        if [ -e "$SLEEP_MARKER" ]; then
-          log_info "monitor: recovery cancelled because system sleep began"
-        else
-          recover_shell "$uid" "$pid"
-        fi
-        tracked_pid=""
-        failures=0
-      fi
+      starved_ticks=0
+      wait_for_next_tick "$deadline"
+      continue
     fi
 
-    sleep "$CHECK_INTERVAL_SECONDS"
+    # systemd freezes the user slice before invoking system-sleep hooks. A probe
+    # already in flight can therefore time out after suspend has begun. Do not
+    # count or diagnose that expected failure once the hook's marker is visible.
+    if [ -e "$SLEEP_MARKER" ]; then
+      if [ "$failures" -gt 0 ]; then
+        log_info "monitor: discarding pending health failures because system sleep began"
+      fi
+      failures=0
+      starved_ticks=0
+      wait_for_next_tick "$deadline"
+      continue
+    fi
+
+    # A silent compositor and a machine too loaded to schedule the probe look
+    # identical from here. Only one of them is fixed by killing GNOME Shell.
+    classification=$(classify_system_load)
+    verdict=${classification%% *}
+    reason=${classification#* }
+
+    if [ "$verdict" = "starved" ]; then
+      starved_ticks=$((starved_ticks + 1))
+      # Never escalate to recovery: the compositor is a victim here, not the
+      # cause, and restarting it would destroy a working session without
+      # returning any CPU or I/O to the machine.
+      #
+      # Hold the failure count rather than clearing it. Zeroing would mean that
+      # on an intermittently loaded machine -- ticks alternating starved and
+      # responsive -- a genuinely wedged shell could never reach FAILURE_LIMIT,
+      # and the user would still be left hard-resetting. A starved tick simply
+      # does not count; it does not forgive the ticks that did.
+      log_warn "monitor: health probe failed under system-wide resource starvation (tick $starved_ticks); $reason; not treating this as a shell hang"
+      # Snapshot the first tick, then every fourth, so a long overload logs
+      # progress without piling collections onto an already starved machine.
+      if [ "$starved_ticks" -eq 1 ] || [ $((starved_ticks % 4)) -eq 0 ]; then
+        run_snapshot_detached starvation-snapshot \
+          "system starvation while gnome-shell PID $pid was unreachable (tick $starved_ticks)" \
+          "$reason" 180
+      fi
+      wait_for_next_tick "$deadline"
+      continue
+    fi
+
+    if [ "$starved_ticks" -gt 0 ]; then
+      log_info "monitor: system load recovered after $starved_ticks starved tick(s); resuming shell-hang accounting"
+      starved_ticks=0
+    fi
+
+    failures=$((failures + 1))
+    log_warn "monitor: gnome-shell PID $pid unresponsive (attempt $failures/$FAILURE_LIMIT); system responsive ($reason)"
+
+    # Collect the cheap snapshot on the way up and the expensive one only on the
+    # attempt that triggers recovery, where it is the last chance to capture the
+    # compositor's threads before it is signalled.
+    if [ "$failures" -ge "$FAILURE_LIMIT" ]; then
+      detail=full
+    else
+      detail=standard
+    fi
+    if [ "$detail" = full ]; then
+      run_snapshot_detached --preempt snapshot \
+        "gnome-shell unresponsive attempt $failures/$FAILURE_LIMIT" \
+        "$uid" "$pid" 180 "$detail"
+    else
+      run_snapshot_detached snapshot \
+        "gnome-shell unresponsive attempt $failures/$FAILURE_LIMIT" \
+        "$uid" "$pid" 180 "$detail"
+    fi
+
+    if [ "$failures" -ge "$FAILURE_LIMIT" ]; then
+      # Give the final snapshot a brief head start so the thread state is
+      # captured before the signal lands, but never wait on it.
+      sleep 2
+      if [ -e "$SLEEP_MARKER" ]; then
+        log_info "monitor: recovery cancelled because system sleep began"
+      else
+        recover_shell "$uid" "$pid"
+      fi
+      tracked_pid=""
+      failures=0
+    fi
+
+    wait_for_next_tick "$deadline"
   done
 }
 
@@ -427,8 +785,21 @@ case "${1:-monitor}" in
       "${5:-120}" \
       "${6:-standard}"
     ;;
+  starvation-snapshot)
+    collect_starvation_state \
+      "${2:?label required}" \
+      "${3:-}" \
+      "${4:-180}"
+    ;;
+  classify)
+    # Prints "starved <evidence>" or "responsive <measurements>". Exits non-zero
+    # when the machine is starved, so it can gate a shell command.
+    classification=$(classify_system_load)
+    printf '%s\n' "$classification"
+    [ "${classification%% *}" != "starved" ]
+    ;;
   *)
-    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]}" >&2
+    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|classify|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]|starvation-snapshot LABEL [REASON] [LOOKBACK]}" >&2
     exit 2
     ;;
 esac

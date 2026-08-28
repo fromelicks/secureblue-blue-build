@@ -9,12 +9,44 @@ ExecStart=/usr/libexec/fromelicks-gnome-hang-monitor monitor
 Restart=always
 RestartSec=10s
 
-# Three failed Shell-owned D-Bus probes produce detailed snapshots before the
-# monitor terminates the hung shell and lets GDM recover the session.
+# The monitor must keep running and stay able to recover the session precisely
+# when the machine is too loaded for anything else to run. Without this it is
+# just another task on a saturated runqueue and its recovery never fires.
+Nice=-15
+CPUWeight=10000
+IOWeight=1000
+OOMScoreAdjust=-900
+
+# Three failed Shell-owned D-Bus probes produce a snapshot before the monitor
+# terminates the hung shell and lets GDM recover the session. Failures caused by
+# system-wide resource starvation are classified separately and never escalate
+# to killing the compositor.
 Environment=CHECK_INTERVAL_SECONDS=30
 Environment=PROBE_TIMEOUT_SECONDS=5
 Environment=FAILURE_LIMIT=3
 Environment=RECOVER_HUNG_SHELL=yes
+
+# Snapshots run detached from the check loop under this hard bound, so a slow
+# collection can no longer stretch the interval between health checks. It MUST
+# stay below CHECK_INTERVAL_SECONDS: only one snapshot may be in flight, so a
+# routine collection that outlives its own tick makes the next tick's request
+# hit the in-flight guard and be dropped. Losing the second rung of a failure
+# ladder is losing evidence at exactly the moment the ladder is climbing. The
+# script clamps this if it is ever raised past the interval, but keep the unit
+# honest anyway.
+Environment=SNAPSHOT_TIMEOUT_SECONDS=25
+
+# Starvation classifier thresholds. SPAWN_LATENCY is the wall time of one
+# fork+exec of /usr/bin/true; on this hardware an idle baseline is ~3 ms, and
+# during the 2026-08-26 incident even a plain runuser took seconds.
+Environment=SPAWN_LATENCY_THRESHOLD_MS=250
+Environment=PSI_CPU_SOME_THRESHOLD=90
+Environment=PSI_IO_FULL_THRESHOLD=60
+Environment=PSI_MEM_FULL_THRESHOLD=25
+
+# ${EPOCHREALTIME} renders its decimal separator per locale; the spawn-latency
+# probe parses it as an integer.
+Environment=LC_ALL=C
 
 RuntimeDirectory=gnome-diagnostics
 RuntimeDirectoryMode=0700
@@ -31,6 +63,47 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE
+
+# Sandboxing that costs this service nothing: it never changes ABI personality,
+# never asks for realtime scheduling, creates no files outside RuntimeDirectory,
+# never unshares a namespace, and speaks only AF_UNIX. Kernel messages are read
+# with "journalctl -b -k" -- the journal on disk -- not dmesg or /dev/kmsg, so
+# ProtectKernelLogs= is free too. Takes systemd-analyze security from 5.8 to
+# 4.1 with no behaviour change.
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+IPAddressDeny=any
+
+# DELIBERATELY ABSENT -- do not add these to improve the security score. Each is
+# suggested by systemd-analyze security and each breaks this service:
+#
+#   ProcSubset=pid     Hides every non-pid /proc file, including /proc/pressure/*.
+#                      That is the whole starvation classifier: without PSI the
+#                      monitor cannot tell an overloaded machine from a wedged
+#                      compositor, so it reclassifies overload as a hang and
+#                      kills GNOME Shell -- the exact failure this service was
+#                      written to stop. Also loses /proc/loadavg, /proc/meminfo
+#                      and /proc/cmdline from every snapshot.
+#   ProtectProc=       Anything but "default" hides other users' processes, i.e.
+#                      gnome-shell itself. That is the entire job.
+#   PrivateUsers=      Breaks the runuser calls used to query the user session.
+#   SystemCallFilter=@system-service
+#                      Excludes @debug, so eu-stack loses ptrace/process_vm_readv
+#                      and every thread backtrace fails. @system-service @debug
+#                      would work, but a missing call means SIGSYS mid-incident;
+#                      not worth it while this is untested on the target machine.
+#   CapabilityBoundingSet=~CAP_SYS_PTRACE / ~CAP_KILL / ~CAP_DAC_* / ~CAP_SET*
+#                      These four capabilities are the service's reason to exist.
+#
+# PrivateNetwork=yes is the heaviest single row (0.5) but RestrictAddressFamilies
+# above already makes an internet socket unallocatable, so it would buy score
+# rather than safety.
 
 [Install]
 WantedBy=graphical.target

@@ -1,0 +1,36 @@
+[Unit]
+Description=Enable the io.cost controller so IOWeight= applies on NVMe
+Documentation=https://github.com/fromelicks/secureblue-blue-build/issues/13
+After=sysinit.target
+# NOT Before=basic.target: systemd gives every service an implicit
+# After=basic.target unless DefaultDependencies=no, so combining that with
+# WantedBy=basic.target forms an ordering cycle and systemd resolves it by
+# deleting this unit's start job -- silently leaving io.cost disabled and every
+# IOWeight= in the slice drop-ins inert. Ordering before systemd-user-sessions
+# is both cycle-free and early enough: no user manager exists yet.
+Before=systemd-user-sessions.service
+ConditionPathExists=/sys/fs/cgroup/io.cost.qos
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/fromelicks-io-cost enable
+
+# Writing io.cost.model/io.cost.qos requires a writable cgroupfs, so
+# ProtectControlGroups= and ProtectKernelTunables= must stay off here.
+# ProtectSystem=strict leaves /sys writable, which is what this needs.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=basic.target
