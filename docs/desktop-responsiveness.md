@@ -153,9 +153,12 @@ Now:
 
 - snapshots run **detached** from the loop, and are reniced to +19 (and ionice
   idle) so the collector never outbids the compositor it is diagnosing;
-- routine snapshots are bounded by `SNAPSHOT_TIMEOUT_SECONDS=25`, deliberately
-  **below** the 30 s check interval, so a collection can never still hold the
-  single in-flight slot when the next tick needs it;
+- routine snapshots are bounded by `SNAPSHOT_TIMEOUT_SECONDS=25` plus a 3 s
+  `timeout -k` grace, deliberately **below** the 30 s check interval, so a
+  collection can never still hold the single in-flight slot when the next tick
+  needs it — and the script clamps the budget to the interval minus the grace,
+  because trusting the unit is what let a stale `45` drop every second
+  snapshot;
 - only one may be in flight and a second is dropped — *except* the pre-recovery
   snapshot, which pre-empts the in-flight one and gets
   `FULL_SNAPSHOT_TIMEOUT_SECONDS=60`. It is the last chance to capture this

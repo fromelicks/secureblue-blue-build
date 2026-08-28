@@ -34,6 +34,23 @@ SNAPSHOT_TIMEOUT_SECONDS=${SNAPSHOT_TIMEOUT_SECONDS:-25}
 FULL_SNAPSHOT_TIMEOUT_SECONDS=${FULL_SNAPSHOT_TIMEOUT_SECONDS:-60}
 MIN_TICK_SLEEP_SECONDS=${MIN_TICK_SLEEP_SECONDS:-5}
 
+# timeout(1) sends TERM at the budget and KILL this much later, so real slot
+# occupancy is budget + grace. A collection wedged in an uninterruptible /proc
+# read is precisely the case where the grace gets used, and precisely the case
+# where the machine is sick enough that the next tick matters.
+SNAPSHOT_KILL_GRACE_SECONDS=3
+FULL_SNAPSHOT_KILL_GRACE_SECONDS=10
+
+# Enforce the single-slot invariant here rather than trusting whoever set the
+# environment: this exact drift (a stale 45 s override against a 30 s interval)
+# silently disabled the second snapshot of every failure ladder. Leave a tick's
+# worth of margin so a collection dispatched mid-tick still clears the slot.
+if [ "$SNAPSHOT_TIMEOUT_SECONDS" -gt \
+     "$((CHECK_INTERVAL_SECONDS - SNAPSHOT_KILL_GRACE_SECONDS - 2))" ]; then
+  SNAPSHOT_TIMEOUT_SECONDS=$((CHECK_INTERVAL_SECONDS - SNAPSHOT_KILL_GRACE_SECONDS - 2))
+  [ "$SNAPSHOT_TIMEOUT_SECONDS" -ge 5 ] || SNAPSHOT_TIMEOUT_SECONDS=5
+fi
+
 # Starvation classifier. A failed probe means "the compositor did not answer",
 # which is also what a machine too loaded to schedule anything looks like.
 # These decide which of the two it was.
@@ -481,10 +498,12 @@ snapshot_nice_prefix() {
 }
 
 run_snapshot_detached() {
-  local preempt=no budget="$SNAPSHOT_TIMEOUT_SECONDS" nice_prefix
+  local preempt=no nice_prefix
+  local budget="$SNAPSHOT_TIMEOUT_SECONDS" grace="$SNAPSHOT_KILL_GRACE_SECONDS"
   if [ "${1:-}" = "--preempt" ]; then
     preempt=yes
     budget="$FULL_SNAPSHOT_TIMEOUT_SECONDS"
+    grace="$FULL_SNAPSHOT_KILL_GRACE_SECONDS"
     shift
   fi
   if snapshot_in_flight; then
@@ -501,7 +520,7 @@ run_snapshot_detached() {
     SNAPSHOT_PID=""
   fi
   mapfile -t nice_prefix < <(snapshot_nice_prefix)
-  "${nice_prefix[@]}" timeout -k 10s "${budget}s" "$SELF" "$@" &
+  "${nice_prefix[@]}" timeout -k "${grace}s" "${budget}s" "$SELF" "$@" &
   SNAPSHOT_PID=$!
 }
 

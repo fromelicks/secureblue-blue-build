@@ -48,12 +48,16 @@ and the loop sleeps to the next wall-clock tick boundary (with a 5 s floor). A
 slow collection therefore cannot delay recovery, which was the defect that
 prevented recovery during the 2026-08-26 incident.
 
-Routine collections are bounded by `SNAPSHOT_TIMEOUT_SECONDS` (25 s), below the
-30 s check interval so one can never still occupy the single in-flight slot when
-the next tick needs it. The pre-recovery collection is the exception: it
-**pre-empts** whatever is in flight and gets `FULL_SNAPSHOT_TIMEOUT_SECONDS`
-(60 s), because it is the last chance to capture this compositor before it is
-signalled.
+Routine collections are bounded by `SNAPSHOT_TIMEOUT_SECONDS` (25 s) plus a 3 s
+`timeout -k` grace — 28 s of worst-case slot occupancy, below the 30 s check
+interval, so one can never still occupy the single in-flight slot when the next
+tick needs it. The script clamps the budget to `CHECK_INTERVAL_SECONDS` minus
+the grace rather than trusting the unit: a stale `45` override in the unit file
+silently dropped the second snapshot of every failure ladder, which is the rung
+that shows whether a hang is progressing. The pre-recovery collection is the
+exception: it **pre-empts** whatever is in flight and gets
+`FULL_SNAPSHOT_TIMEOUT_SECONDS` (60 s), because it is the last chance to capture
+this compositor before it is signalled.
 
 Per-thread wait channels, syscalls and kernel stacks are captured at *every*
 detail level — they are plain `/proc` reads. Only `eu-stack` and the system-wide

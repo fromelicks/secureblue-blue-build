@@ -27,8 +27,14 @@ Environment=FAILURE_LIMIT=3
 Environment=RECOVER_HUNG_SHELL=yes
 
 # Snapshots run detached from the check loop under this hard bound, so a slow
-# collection can no longer stretch the interval between health checks.
-Environment=SNAPSHOT_TIMEOUT_SECONDS=45
+# collection can no longer stretch the interval between health checks. It MUST
+# stay below CHECK_INTERVAL_SECONDS: only one snapshot may be in flight, so a
+# routine collection that outlives its own tick makes the next tick's request
+# hit the in-flight guard and be dropped. Losing the second rung of a failure
+# ladder is losing evidence at exactly the moment the ladder is climbing. The
+# script clamps this if it is ever raised past the interval, but keep the unit
+# honest anyway.
+Environment=SNAPSHOT_TIMEOUT_SECONDS=25
 
 # Starvation classifier thresholds. SPAWN_LATENCY is the wall time of one
 # fork+exec of /usr/bin/true; on this hardware an idle baseline is ~3 ms, and
