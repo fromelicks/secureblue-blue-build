@@ -90,6 +90,29 @@ The monitor pauses while the system sleep hook is active. The sleep hook still
 captures immediate pre-suspend and post-resume state, but no longer launches a
 background watchdog process.
 
+## Service sandboxing
+
+The unit runs as root and keeps exactly four capabilities — `CAP_SYS_PTRACE`,
+`CAP_KILL`, `CAP_DAC_READ_SEARCH` and `CAP_SETUID`/`CAP_SETGID` — because it has
+to unwind another user's compositor threads and signal that compositor from
+outside the session. Everything else that costs it nothing is switched on, which
+puts `systemd-analyze security` at **4.1 OK**.
+
+Four of that tool's remaining suggestions are **deliberately not applied**, and
+the unit file says so inline. The dangerous one is `ProcSubset=pid`: it hides
+every non-process `/proc` file, including `/proc/pressure/*`. That is the whole
+starvation classifier, and without PSI the monitor cannot tell an overloaded
+machine from a wedged compositor — so it would treat overload as a hang and kill
+GNOME Shell, which is the precise failure this service exists to prevent. The
+others: `ProtectProc=` at anything but `default` hides other users' processes
+(the entire job), `PrivateUsers=` breaks the `runuser` calls, and
+`SystemCallFilter=@system-service` excludes `@debug` and so breaks every
+`eu-stack` backtrace.
+
+Treat the exposure number as a checklist, never a target. This service is
+supposed to be privileged; the value of the tool here is the rows that are free,
+not the score.
+
 ## Operator commands
 
 ```bash

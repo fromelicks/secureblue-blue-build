@@ -64,5 +64,46 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE
 
+# Sandboxing that costs this service nothing: it never changes ABI personality,
+# never asks for realtime scheduling, creates no files outside RuntimeDirectory,
+# never unshares a namespace, and speaks only AF_UNIX. Kernel messages are read
+# with "journalctl -b -k" -- the journal on disk -- not dmesg or /dev/kmsg, so
+# ProtectKernelLogs= is free too. Takes systemd-analyze security from 5.8 to
+# 4.1 with no behaviour change.
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+IPAddressDeny=any
+
+# DELIBERATELY ABSENT -- do not add these to improve the security score. Each is
+# suggested by systemd-analyze security and each breaks this service:
+#
+#   ProcSubset=pid     Hides every non-pid /proc file, including /proc/pressure/*.
+#                      That is the whole starvation classifier: without PSI the
+#                      monitor cannot tell an overloaded machine from a wedged
+#                      compositor, so it reclassifies overload as a hang and
+#                      kills GNOME Shell -- the exact failure this service was
+#                      written to stop. Also loses /proc/loadavg, /proc/meminfo
+#                      and /proc/cmdline from every snapshot.
+#   ProtectProc=       Anything but "default" hides other users' processes, i.e.
+#                      gnome-shell itself. That is the entire job.
+#   PrivateUsers=      Breaks the runuser calls used to query the user session.
+#   SystemCallFilter=@system-service
+#                      Excludes @debug, so eu-stack loses ptrace/process_vm_readv
+#                      and every thread backtrace fails. @system-service @debug
+#                      would work, but a missing call means SIGSYS mid-incident;
+#                      not worth it while this is untested on the target machine.
+#   CapabilityBoundingSet=~CAP_SYS_PTRACE / ~CAP_KILL / ~CAP_DAC_* / ~CAP_SET*
+#                      These four capabilities are the service's reason to exist.
+#
+# PrivateNetwork=yes is the heaviest single row (0.5) but RestrictAddressFamilies
+# above already makes an internet socket unallocatable, so it would buy score
+# rather than safety.
+
 [Install]
 WantedBy=graphical.target
