@@ -194,6 +194,57 @@ run0 -i cat /sys/fs/pstore/dmesg-ramoops-0
 Records are removed from `/sys/fs/pstore` once archived. `kernel.dmesg_restrict=1`
 means reading them needs root.
 
+## Testing the whole chain deliberately
+
+Nothing here can be proven by inspection. `systemd-pstore.service` carries
+`ConditionDirectoryNotEmpty=/sys/fs/pstore`, so the remount, the archive and the
+unlink are all unreachable until a record actually exists — which means until a
+crash. If you would rather find a flaw now than after the next real one, force a
+panic.
+
+**This is a real crash of a working machine.** Save everything, close what
+matters, and expect to lose anything still in the page cache that the sync does
+not catch.
+
+```bash
+run0 --pipe bash -c 'echo s > /proc/sysrq-trigger; sleep 2; echo c > /proc/sysrq-trigger'
+```
+
+`s` syncs filesystems first; `c` dereferences a NULL pointer to panic on
+purpose. You should get a trace on screen that stays for 30 seconds — that alone
+verifies the `kernel.panic = 30` half — then a reboot.
+
+After it comes back up, the whole chain is verified by four checks:
+
+```bash
+run0 -i ls /sys/fs/pstore/          # dmesg-ramoops-0 existed at boot
+journalctl -b -u systemd-pstore.service
+ls /var/lib/systemd/pstore/         # the archived copy
+run0 -i ls /sys/fs/pstore/          # MUST now be empty
+```
+
+The last one is the point of the exercise. An archived copy in
+`/var/lib/systemd/pstore` only proves the *read* path; `/sys/fs/pstore` being
+empty afterwards is what proves the `ExecStartPre` remount worked and the record
+could be unlinked. If the archive is there but `/sys/fs/pstore` still holds the
+record, the remount did not take and the region will fill on the next crash —
+which is the failure this document is about.
+
+Caveats, in the order they are likely to bite:
+
+- **`sysrq-c` is not in the enabled mask.** `etc/sysctl.d/99-sysrq-debug.conf`
+  sets `kernel.sysrq = 176` (sync 16 + remount-ro 32 + reboot 128); the crash
+  key needs the debug-dump bit (8). Writes to `/proc/sysrq-trigger` are supposed
+  to bypass the mask — `write_sysrq_trigger()` calls `__handle_sysrq()` with
+  mask checking off — but this has not been tested here. If nothing happens,
+  raise it for the moment with `run0 sysctl -w kernel.sysrq=184` and put it back
+  afterwards. Do not persist the change; the mask is deliberate.
+- **`lockdown=confidentiality` is active.** It blocks memory-dump and
+  kernel-debug sysrq keys. Whether it also refuses `c` has not been established.
+- **ramoops is best-effort even when everything is configured.** A deliberate
+  panic is the most favourable case — the kernel reaches its panic handler
+  cleanly. A pass here does not guarantee capture from a firmware-level reset.
+
 ## If it recurs and ramoops still captures nothing
 
 The next step is `netconsole`, which streams kernel messages over UDP to another
