@@ -3,7 +3,7 @@
 # image will be published to ghcr.io/<user>/<name>
 name: secureblue-nvidia-open-hardened
 # description will be included in the image's metadata
-description: secureblue with GNOME, open NVIDIA and a few personal tweaks
+description: secureblue with GNOME, an optional Niri/DMS session, open NVIDIA and a few personal tweaks
 
 # the base image to build on top of (FROM) and the version tag to use
 base-image: ghcr.io/secureblue/silverblue-nvidia-open-hardened
@@ -30,6 +30,10 @@ modules:
         enable:
           - name: wezfurlong/wezterm-nightly
             chroot: fedora-44-x86_64
+          # DMS publishes Fedora packages and pulls its DankLinux COPR dependency.
+          # Niri itself remains Fedora's package, including its GDM session entry.
+          - name: avengemedia/dms
+            chroot: fedora-44-x86_64
     install:
       packages:
         - chezmoi
@@ -37,6 +41,7 @@ modules:
         - clang-tools-extra
         - code # repo: files:vscode.repo
         - compiler-rt
+        - dms # repo: copr:copr.fedorainfracloud.org:avengemedia:dms
         - emacs
         - fish
         - foot
@@ -55,6 +60,7 @@ modules:
         - micro
         - mise
         - nushell # repo: files:fury-nushell.repo
+        - niri
         - rclone
         - sbcl
         - syncthing
