@@ -138,6 +138,12 @@ These gate multiple features. Verified against secureblue source.
     `rpm-ostreed-automatic.timer` (note the bootc unit uses `--apply`, i.e. it **reboots**),
     and always verify a new karg on `/proc/cmdline` after the reboot — the failure is silent.
     Repair a stuck one with `bootc loader-entries set-options-for-source`.
+    **The Legion carries this drift right now:** its BLS entry has
+    `x-options-source-fromelicks` pinning `reserve_mem=2M:4096:oops`,
+    `ramoops.mem_name=oops` and `ramoops.ecc=1` independently of the recipe. Deleting
+    those from `recipes/recipe.yml` will NOT take them off `/proc/cmdline` — the tracked
+    source has to be dropped by hand with the same command and no `--options`. Check with
+    `grep x-options-source /boot/loader/entries/*.conf`.
     See [`docs/kernel-arguments.md`](docs/kernel-arguments.md).
 
 ## Feature implementation plan
@@ -175,6 +181,13 @@ These gate multiple features. Verified against secureblue source.
   reads `/usr/lib/bootc/kargs.d/`, so an rpm-ostree deployment drops every karg the recipe
   declares without saying so (constraint 13). If the recipe changed a karg, also check
   `/proc/cmdline` after the reboot.
+  `bootc upgrade` only refreshes the ref the deployment already points at. To install onto
+  a fresh machine, or to change which image is tracked, the equivalent of the old
+  `rpm-ostree rebase` is
+  `run0 bootc switch --enforce-container-sigpolicy ghcr.io/fromelicks/secureblue-nvidia-open-hardened:latest`
+  — the flag is **not** the default, and without it the origin is rewritten from
+  `ostree-image-signed:` to `ostree-unverified-image:`, silently dropping cosign
+  verification on that update and every one after.
 
 ## Suggested implementation order
 

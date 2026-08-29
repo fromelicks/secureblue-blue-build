@@ -94,14 +94,45 @@ grep -o 'reserve_mem=[^ ]*\|ramoops\.[^ ]*' /proc/cmdline
 grep x-options-source /boot/loader/entries/*.conf
 ```
 
-Pick a source name of your own (`fromelicks`). Do **not** reuse
-`bootc-kargs-d`, which the `--help` text uses as an example: `bootc`'s own
-`kargs.d` path writes *untracked* options via
-`ostree_sysroot_deployment_set_kargs_in_place` and claims no source name, so
-reusing it invites a collision.
+Pick a source name of your own (`fromelicks`) rather than `bootc-kargs-d`, which
+the `--help` text uses as an example. `bootc`'s own `kargs.d` path writes
+*untracked* options via `ostree_sysroot_deployment_set_kargs_in_place` and does
+not claim a source name today, so nothing would actually collide right now —
+the reason is that the name reads as bootc-owned, and a future version that does
+start tracking its `kargs.d` under it would then be managing a set you wrote by
+hand. A name that is unambiguously yours keeps the two apart whatever bootc
+does later.
 
 The origin is preserved — it stays `ostree-image-signed:`, so cosign
 verification is not affected.
+
+### This creates drift; know how to undo it
+
+A tracked source is **not** a one-off edit. `bootc` recomputes `options` as the
+merge of all tracked sources on every deployment, so from here on those kargs are
+pinned by the BLS entry independently of `recipes/recipe.yml`.
+
+The consequence to be aware of: **removing them from the recipe will not remove
+them from the command line.** The `kargs.d` delta computes `removed=`, but the
+`fromelicks` source re-adds them, and you are left with a karg on `/proc/cmdline`
+that nothing in the repo explains. Passing `--options` with a new value updates
+the source; omitting `--options` entirely removes the source and drops its
+arguments from the merged line:
+
+```bash
+run0 --pipe bash -c 'bootc loader-entries set-options-for-source --source fromelicks'
+```
+
+So the pin has to be released *by hand* whenever the recipe drops a karg it
+covers. This is real local drift, of the kind
+[`AGENTS.md`](../AGENTS.md)'s "drift control, not impermanence" principle exists
+to keep visible — it is accepted here only because the alternative is a karg that
+no mechanism can ever apply. Prefer the two-build route below when the extra
+cycle is affordable, and check for stale sources with:
+
+```bash
+grep x-options-source /boot/loader/entries/*.conf
+```
 
 ### Fallback
 

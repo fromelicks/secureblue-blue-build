@@ -114,48 +114,57 @@ Caveat: ramoops is best-effort. Firmware that clears RAM on reset, or a reset so
 abrupt the kernel never runs its panic handler, still captures nothing. That is
 why the on-screen path is fixed as well — the two fail in different ways.
 
-### /sys/fs/pstore has to be remounted writable
+### A note on /sys/fs/pstore's mount options
 
-`/sys/fs/pstore` is mounted **read-only** and stays that way for the whole boot.
-This was originally expected to resolve itself once ramoops attached. It does
-not — verified on the first boot that actually had the kargs:
+Earlier revisions of this document claimed `/sys/fs/pstore` was mounted `ro` and
+would need remounting before `systemd-pstore` could unlink archived records.
+**That was wrong**, and the way it was wrong is worth recording.
+
+It is mounted `rw`:
 
 ```
-$ cat /sys/module/pstore/parameters/backend
-ramoops
-$ grep pstore /proc/mounts
-none /sys/fs/pstore pstore ro,seclabel,nosuid,nodev,noexec,relatime 0 0
+$ grep pstore /proc/self/mountinfo
+55 46 0:30 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:11 - pstore none rw,seclabel
 ```
 
-PID 1 mounts pstore during early `mount-setup`, well before
-`systemd-modules-load.service` loads ramoops from
-`etc/modules-load.d/fromelicks-ramoops.conf`, and a mount does not re-evaluate
-afterwards. There is no fstab entry, no mount unit, and nothing in secureblue
-that touches it.
+The `ro` reading came from inspecting `/proc/mounts` inside an agent sandbox that
+rbinds `/sys` read-only. In that view `/sys/fs/cgroup` and
+`/sys/firmware/efi/efivars` also report `ro`, which is impossible on a running
+systemd host — that is the tell. `ujust check-crash-capture` already prints
+`findmnt -no OPTIONS /sys/fs/pstore`, which refutes it in one line.
 
-Read-only is enough for `systemd-pstore` to *copy* a record to
-`/var/lib/systemd/pstore`, but not to unlink it afterwards — and
-`/usr/lib/systemd/systemd-pstore` has no remount logic of its own. Left alone,
-the 2 MiB region is never cleared: the first crash fills it and every crash
-after that captures nothing. That is precisely the silent failure this document
-exists to prevent, so the remount is shipped rather than left as advice:
+So there is nothing to fix here: `systemd-pstore.service` can copy a record to
+`/var/lib/systemd/pstore` *and* unlink it, and the 2 MiB region is cleared
+normally after each archive.
 
-`usr/lib/systemd/system/systemd-pstore.service.d/10-fromelicks-remount-rw.conf`
+The general lesson, since this cost a shipped commit: **never characterise a
+mount, a namespace or a `/sys` or `/proc` attribute from inside a sandbox.**
+Check it unsandboxed, and cross-check against something whose value you already
+know.
+
+### systemd-pstore is not ordered after the ramoops module load
+
+A real gap, found while the above was being disproved.
+`systemd-pstore.service` is `DefaultDependencies=no`, `Before=sysinit.target`,
+and orders only `After=modprobe@efi_pstore.service`.
+`systemd-modules-load.service` — which inserts ramoops from
+`etc/modules-load.d/fromelicks-ramoops.conf` — is *also* `DefaultDependencies=no`
+and `Before=sysinit.target`, with no ordering relative to it. The two are
+scheduled concurrently.
+
+Records only appear in `/sys/fs/pstore` once the ramoops backend registers. If
+`systemd-pstore.service` evaluates `ConditionDirectoryNotEmpty` first, it is
+skipped and the crash record is lost on the next boot. On the boot where this
+was checked, ramoops was inserted at monotonic 45.567 and the condition
+evaluated at 47.459 — correct by luck, not by dependency.
+
+The fix mirrors the pattern the unit already uses for EFI pstore:
 
 ```ini
-[Service]
-ExecStartPre=/usr/bin/mount -o remount,rw /sys/fs/pstore
+[Unit]
+Wants=modprobe@ramoops.service
+After=modprobe@ramoops.service
 ```
-
-`ExecStartPre` runs after the unit's conditions, and the unit carries
-`ConditionDirectoryNotEmpty=/sys/fs/pstore`, so on an ordinary boot with no
-records this never executes.
-
-A possibly cleaner alternative, **not** taken because it is unverified: get
-ramoops into the initramfs (`rd.driver.pre=ramoops`, or a dracut `force_drivers`
-entry) so a writable backend exists before PID 1 mounts pstore. That depends on
-pstore's read-only state actually being caused by the missing backend rather
-than being unconditional, which has not been established here.
 
 ## Checking and reading crash records
 
@@ -179,9 +188,13 @@ booted deployment's `kargs.d`. They were stranded for days by exactly this. If
 zones hold uninitialized RAM; there were 51 on the first boot with the region
 reserved. They stop once each zone has been written.
 
-Note also that `check-crash-capture` uses `run0 -i find` on `/sys/fs/pstore` and
-`/var/lib/systemd/pstore`. If you dismiss or fail those polkit prompts, those
-sections print nothing — which looks identical to "no records".
+Note also that `check-crash-capture` counts records with `run0 -i find` on
+`/sys/fs/pstore` and `/var/lib/systemd/pstore`. If you dismiss or fail those
+polkit prompts it reports `0 entr(ies)` — a confident false negative, not a
+blank. Its guard for this is currently dead code: the `if` tests the exit status
+of `wc -l` at the end of the pipeline, which is always 0, so the "unreadable
+(needs root)" branch can never run. Authenticate the prompts, or read the paths
+directly as root.
 
 To read records by hand:
 
@@ -197,50 +210,68 @@ means reading them needs root.
 ## Testing the whole chain deliberately
 
 Nothing here can be proven by inspection. `systemd-pstore.service` carries
-`ConditionDirectoryNotEmpty=/sys/fs/pstore`, so the remount, the archive and the
-unlink are all unreachable until a record actually exists — which means until a
-crash. If you would rather find a flaw now than after the next real one, force a
-panic.
+`ConditionDirectoryNotEmpty=/sys/fs/pstore`, so the archive and the unlink are
+unreachable until a record actually exists — which means until a crash. If you
+would rather find a flaw now than after the next real one, force a panic.
 
 **This is a real crash of a working machine.** Save everything, close what
 matters, and expect to lose anything still in the page cache that the sync does
 not catch.
 
 ```bash
-run0 --pipe bash -c 'echo s > /proc/sysrq-trigger; sleep 2; echo c > /proc/sysrq-trigger'
+run0 --pipe bash -c 'echo s > /proc/sysrq-trigger'
+journalctl -k -n5 | grep "Emergency Sync complete"    # wait for this
+run0 --pipe bash -c 'echo u > /proc/sysrq-trigger; echo c > /proc/sysrq-trigger'
 ```
 
-`s` syncs filesystems first; `c` dereferences a NULL pointer to panic on
-purpose. You should get a trace on screen that stays for 30 seconds — that alone
-verifies the `kernel.panic = 30` half — then a reboot.
+`s` schedules an emergency sync and returns *immediately* — it is asynchronous,
+which is why you wait for `Emergency Sync complete` in dmesg rather than sleeping
+a fixed interval. `u` then remounts everything read-only, and `c` dereferences a
+NULL pointer to panic on purpose. Both `s` (16) and `u` (32) are already in the
+enabled mask.
 
-After it comes back up, the whole chain is verified by four checks:
+You should get a trace on screen that stays for 30 seconds — that alone verifies
+the `kernel.panic = 30` half — then a reboot.
+
+After it comes back up, three checks in this order:
 
 ```bash
-run0 -i ls /sys/fs/pstore/          # dmesg-ramoops-0 existed at boot
-journalctl -b -u systemd-pstore.service
-ls /var/lib/systemd/pstore/         # the archived copy
-run0 -i ls /sys/fs/pstore/          # MUST now be empty
+journalctl -b -u systemd-pstore.service   # did it run, or hit its condition?
+run0 -i ls /var/lib/systemd/pstore/       # the archived copy
+run0 -i ls /sys/fs/pstore/                # should now be empty
 ```
 
-The last one is the point of the exercise. An archived copy in
-`/var/lib/systemd/pstore` only proves the *read* path; `/sys/fs/pstore` being
-empty afterwards is what proves the `ExecStartPre` remount worked and the record
-could be unlinked. If the archive is there but `/sys/fs/pstore` still holds the
-record, the remount did not take and the region will fill on the next crash —
-which is the failure this document is about.
+Do **not** expect to see the record in `/sys/fs/pstore` yourself — by the time
+you have a shell, `systemd-pstore.service` has already archived and unlinked it,
+so an empty directory there is the success case. That a record existed at all is
+established by the journal and by the archived copy, never by looking at
+`/sys/fs/pstore` after the fact.
+
+The failure worth watching for is the journal reporting `skipped, unmet
+condition check ConditionDirectoryNotEmpty=/sys/fs/pstore` on a boot that
+followed a real panic — that is the ordering race described above, not a ramoops
+failure.
+
+`/var/lib/systemd/pstore` is created by the unit's `StateDirectory=`, so on a
+machine that has never archived anything it does not exist and `ls` will say so.
+That is expected, not a fault.
 
 Caveats, in the order they are likely to bite:
 
-- **`sysrq-c` is not in the enabled mask.** `etc/sysctl.d/99-sysrq-debug.conf`
-  sets `kernel.sysrq = 176` (sync 16 + remount-ro 32 + reboot 128); the crash
-  key needs the debug-dump bit (8). Writes to `/proc/sysrq-trigger` are supposed
-  to bypass the mask — `write_sysrq_trigger()` calls `__handle_sysrq()` with
-  mask checking off — but this has not been tested here. If nothing happens,
-  raise it for the moment with `run0 sysctl -w kernel.sysrq=184` and put it back
-  afterwards. Do not persist the change; the mask is deliberate.
-- **`lockdown=confidentiality` is active.** It blocks memory-dump and
-  kernel-debug sysrq keys. Whether it also refuses `c` has not been established.
+- **`sysrq-c` is not in the keyboard mask.**
+  `etc/sysctl.d/99-sysrq-debug.conf` sets `kernel.sysrq = 176` (sync 16 +
+  remount-ro 32 + reboot 128); the crash key needs the debug-dump bit (8). That
+  mask governs the *keyboard* combination. Writes to `/proc/sysrq-trigger` are
+  supposed to bypass it — `write_sysrq_trigger()` calls `__handle_sysrq()` with
+  mask checking off — which is why the recipe above uses the trigger file and not
+  Alt+SysRq. Untested here.
+- **If the trigger write does nothing, do not just raise the mask.**
+  `99-sysrq-debug.conf` states that memory-dump and kernel-debug keys are blocked
+  by `lockdown=confidentiality` regardless of the mask, and lockdown is on
+  `/proc/cmdline`. Whether that covers `c` specifically has not been established.
+  If it does, raising `kernel.sysrq` to 184 achieves nothing while widening the
+  mask, so establish which of the two is stopping it before changing anything —
+  check `dmesg` for a lockdown denial after the write.
 - **ramoops is best-effort even when everything is configured.** A deliberate
   panic is the most favourable case — the kernel reaches its panic handler
   cleanly. A pass here does not guarantee capture from a firmware-level reset.
