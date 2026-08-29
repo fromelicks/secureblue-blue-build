@@ -114,21 +114,48 @@ Caveat: ramoops is best-effort. Firmware that clears RAM on reset, or a reset so
 abrupt the kernel never runs its panic handler, still captures nothing. That is
 why the on-screen path is fixed as well — the two fail in different ways.
 
-**Verify after the first update that actually applies the kargs** (see
-[`kernel-arguments.md`](kernel-arguments.md) — this is not automatic):
-`/sys/fs/pstore` is currently mounted `ro`,
-with no fstab entry, no mount unit, and nothing in secureblue that remounts it —
-so this is the kernel's own doing while no writable backend is registered. It
-should become `rw` once ramoops attaches. If `ujust check-crash-capture` still
-shows `ro` once the region is reserved, `systemd-pstore.service` will be able to copy
-records but not unlink them, so the 2 MiB region will fill up and stop capturing
-after the first crash. The fix in that case is a `systemd-pstore.service`
-drop-in that remounts it first:
+### /sys/fs/pstore has to be remounted writable
+
+`/sys/fs/pstore` is mounted **read-only** and stays that way for the whole boot.
+This was originally expected to resolve itself once ramoops attached. It does
+not — verified on the first boot that actually had the kargs:
+
+```
+$ cat /sys/module/pstore/parameters/backend
+ramoops
+$ grep pstore /proc/mounts
+none /sys/fs/pstore pstore ro,seclabel,nosuid,nodev,noexec,relatime 0 0
+```
+
+PID 1 mounts pstore during early `mount-setup`, well before
+`systemd-modules-load.service` loads ramoops from
+`etc/modules-load.d/fromelicks-ramoops.conf`, and a mount does not re-evaluate
+afterwards. There is no fstab entry, no mount unit, and nothing in secureblue
+that touches it.
+
+Read-only is enough for `systemd-pstore` to *copy* a record to
+`/var/lib/systemd/pstore`, but not to unlink it afterwards — and
+`/usr/lib/systemd/systemd-pstore` has no remount logic of its own. Left alone,
+the 2 MiB region is never cleared: the first crash fills it and every crash
+after that captures nothing. That is precisely the silent failure this document
+exists to prevent, so the remount is shipped rather than left as advice:
+
+`usr/lib/systemd/system/systemd-pstore.service.d/10-fromelicks-remount-rw.conf`
 
 ```ini
 [Service]
 ExecStartPre=/usr/bin/mount -o remount,rw /sys/fs/pstore
 ```
+
+`ExecStartPre` runs after the unit's conditions, and the unit carries
+`ConditionDirectoryNotEmpty=/sys/fs/pstore`, so on an ordinary boot with no
+records this never executes.
+
+A possibly cleaner alternative, **not** taken because it is unverified: get
+ramoops into the initramfs (`rd.driver.pre=ramoops`, or a dracut `force_drivers`
+entry) so a writable backend exists before PID 1 mounts pstore. That depends on
+pstore's read-only state actually being caused by the missing backend rather
+than being unconditional, which has not been established here.
 
 ## Checking and reading crash records
 
@@ -146,6 +173,11 @@ deployment was created by `bootc` — and even then only as a delta against the
 booted deployment's `kargs.d`. They were stranded for days by exactly this. If
 `ujust check-crash-capture` reports the kargs missing after an update, read
 [`kernel-arguments.md`](kernel-arguments.md); it is not a crash-capture problem.
+
+`ramoops: error in header` messages at boot are expected, not a fault. With
+`ecc=1` the driver ECC-scans every zone when it attaches, and on first use those
+zones hold uninitialized RAM; there were 51 on the first boot with the region
+reserved. They stop once each zone has been written.
 
 Note also that `check-crash-capture` uses `run0 -i find` on `/sys/fs/pstore` and
 `/var/lib/systemd/pstore`. If you dismiss or fail those polkit prompts, those
