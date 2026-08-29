@@ -104,6 +104,11 @@ modules:
           - org.gnome.Extensions
           - org.gnome.Weather
 
+  # These land in /usr/lib/bootc/kargs.d/bluebuild-kargs.toml, which ONLY bootc
+  # reads, and which bootc applies as a delta against the booted deployment --
+  # not as desired state. An rpm-ostree deployment drops them silently, and a
+  # karg first shipped under one is then unreachable forever. Update with
+  # `bootc upgrade` and verify /proc/cmdline. See docs/kernel-arguments.md.
   - type: kargs
     kargs:
       - loglevel=4

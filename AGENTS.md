@@ -55,6 +55,7 @@ touching the relevant subsystem.
 | Desktop freezes under load | [`docs/desktop-responsiveness.md`](docs/desktop-responsiveness.md) | The hardening kargs make `fork`+`exec` ~3.3 ms (vs 0.5–1 ms stock), so fork-heavy apps starve the compositor. Fix: `session.slice` ≫ `app.slice` CPU/IO weights, `io.cost` to make `IOWeight` work on NVMe, and a starvation classifier so the hang monitor stops mistaking overload for a wedged shell. |
 | GNOME hang detection | [`docs/gnome-hang-monitor.md`](docs/gnome-hang-monitor.md) | Continuous `org.gnome.Shell.Eval` probe with detached, bounded diagnostics and automatic session recovery. |
 | Spontaneous instant reboots | [`docs/crash-capture.md`](docs/crash-capture.md) | secureblue's `kernel.panic=-1` reboots in zero seconds, EFI pstore is off, ramoops was unconfigured and this firmware has no BERT — so a panic left *no* evidence anywhere. Fix: `kernel.panic=30` override plus ramoops on a `reserve_mem=` named region. |
+| Recipe kargs never reaching the cmdline | [`docs/kernel-arguments.md`](docs/kernel-arguments.md) | `kargs.d` is a **bootc-only** interface that rpm-ostree ignores silently, and bootc applies it as a *delta*, not desired state — so a karg first shipped under an rpm-ostree deployment is unreachable forever. Repair with `bootc loader-entries set-options-for-source`. Includes the `run0` quoting and SELinux gotchas. |
 
 ## Cross-cutting secureblue constraints (MUST be handled)
 
@@ -123,6 +124,27 @@ These gate multiple features. Verified against secureblue source.
     `brew-update`/`brew-upgrade` units via `User=linuxbrew`. Use `ujust brew-shell`
     (systemd-run, no PAM) if a real linuxbrew shell is ever needed; `ujust check-brew`
     reports the state.
+13. **Recipe `kargs` only apply if the deployment is created by `bootc`, and only as a
+    *delta*.** BlueBuild's `kargs` module writes `/usr/lib/bootc/kargs.d/bluebuild-kargs.toml`.
+    That path is read by `bootc` alone — `rpm-ostree`, `librpmostree` and `libostree` contain
+    zero references to it — so `rpm-ostree rebase|upgrade` and `rpm-ostreed-automatic.service`
+    ignore every karg in the recipe, silently. Worse, `bootc` does not treat `kargs.d` as
+    desired state: `bootc_kargs.rs` diffs the **booted** deployment's `kargs.d` against the
+    **incoming** image's and applies only `added=`/`removed=`. So a karg first shipped in a
+    deployment that rpm-ostree created never lands in the BLS, and from then on both sides of
+    every diff contain it — the delta is empty **forever** and no `bootc upgrade` will ever
+    fix it. This is what kept the ramoops kargs off `/proc/cmdline` for days. Update with
+    `bootc upgrade`, prefer `bootc-fetch-apply-updates.timer` over
+    `rpm-ostreed-automatic.timer` (note the bootc unit uses `--apply`, i.e. it **reboots**),
+    and always verify a new karg on `/proc/cmdline` after the reboot — the failure is silent.
+    Repair a stuck one with `bootc loader-entries set-options-for-source`.
+    **The Legion carries this drift right now:** its BLS entry has
+    `x-options-source-fromelicks` pinning `reserve_mem=2M:4096:oops`,
+    `ramoops.mem_name=oops` and `ramoops.ecc=1` independently of the recipe. Deleting
+    those from `recipes/recipe.yml` will NOT take them off `/proc/cmdline` — the tracked
+    source has to be dropped by hand with the same command and no `--options`. Check with
+    `grep x-options-source /boot/loader/entries/*.conf`.
+    See [`docs/kernel-arguments.md`](docs/kernel-arguments.md).
 
 ## Feature implementation plan
 
@@ -153,10 +175,19 @@ These gate multiple features. Verified against secureblue source.
   lint and structure the repo.
 - **Claude Code (cloud) CANNOT:** test hardware-dependent behavior — NVIDIA hybrid graphics, TPM
   sealing, Secure Boot, boot/rebase. Do NOT place real secrets in the repo or cloud env.
-- **Local verification loop (user, on the Legion):** build → push → `rpm-ostree rebase
-  ostree-image-signed:docker://ghcr.io/fromelicks/secureblue-nvidia-open-hardened:latest` → reboot
-  → `rpm-ostree status` / `bootc status` → `ostree admin config-diff` (should be clean) →
-  `ujust audit-secureblue`.
+- **Local verification loop (user, on the Legion):** build → push → `run0 bootc upgrade` →
+  reboot → `bootc status` → `ostree admin config-diff` (should be clean) →
+  `ujust audit-secureblue`. Use `bootc`, **not** `rpm-ostree rebase|upgrade`: only `bootc`
+  reads `/usr/lib/bootc/kargs.d/`, so an rpm-ostree deployment drops every karg the recipe
+  declares without saying so (constraint 13). If the recipe changed a karg, also check
+  `/proc/cmdline` after the reboot.
+  `bootc upgrade` only refreshes the ref the deployment already points at. To install onto
+  a fresh machine, or to change which image is tracked, the equivalent of the old
+  `rpm-ostree rebase` is
+  `run0 bootc switch --enforce-container-sigpolicy ghcr.io/fromelicks/secureblue-nvidia-open-hardened:latest`
+  — the flag is **not** the default, and without it the origin is rewritten from
+  `ostree-image-signed:` to `ostree-unverified-image:`, silently dropping cosign
+  verification on that update and every one after.
 
 ## Suggested implementation order
 
