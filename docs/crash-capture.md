@@ -99,6 +99,11 @@ is hard-coded, which is what makes blind ramoops configuration dangerous.
 `etc/modules-load.d/fromelicks-ramoops.conf` loads the module at boot, since the
 `reserve_mem` route has no autoload alias.
 
+Getting those three onto the command line is not as simple as putting them in
+the recipe: `kargs.d` is a bootc-only interface and bootc applies it as a delta.
+[`kernel-arguments.md`](kernel-arguments.md) has the whole story; the short
+version is *update with `bootc upgrade` and verify `/proc/cmdline`*.
+
 The region survives a warm reboot, and `systemd-pstore.service` (already enabled)
 archives the record to `/var/lib/systemd/pstore` on the next boot.
 
@@ -109,11 +114,13 @@ Caveat: ramoops is best-effort. Firmware that clears RAM on reset, or a reset so
 abrupt the kernel never runs its panic handler, still captures nothing. That is
 why the on-screen path is fixed as well — the two fail in different ways.
 
-**Verify after the first rebase:** `/sys/fs/pstore` is currently mounted `ro`,
+**Verify after the first update that actually applies the kargs** (see
+[`kernel-arguments.md`](kernel-arguments.md) — this is not automatic):
+`/sys/fs/pstore` is currently mounted `ro`,
 with no fstab entry, no mount unit, and nothing in secureblue that remounts it —
 so this is the kernel's own doing while no writable backend is registered. It
 should become `rw` once ramoops attaches. If `ujust check-crash-capture` still
-shows `ro` after the rebase, `systemd-pstore.service` will be able to copy
+shows `ro` once the region is reserved, `systemd-pstore.service` will be able to copy
 records but not unlink them, so the 2 MiB region will fill up and stop capturing
 after the first crash. The fix in that case is a `systemd-pstore.service`
 drop-in that remounts it first:
@@ -130,8 +137,19 @@ ujust check-crash-capture     # is each capture path actually armed?
 ujust show-crash-records      # print anything ramoops preserved
 ```
 
-After the next rebase, `ujust check-crash-capture` should report a reserved
-ramoops region, the module loaded, and `kernel.panic = 30`.
+`kernel.panic = 30` takes effect on the first boot after the update — it comes
+from a `sysctl.d` file, which needs nothing but the new `/usr`.
+
+The ramoops region does **not**. Those three settings are kernel arguments, and
+a karg declared in the recipe only reaches the boot loader entry if the
+deployment was created by `bootc` — and even then only as a delta against the
+booted deployment's `kargs.d`. They were stranded for days by exactly this. If
+`ujust check-crash-capture` reports the kargs missing after an update, read
+[`kernel-arguments.md`](kernel-arguments.md); it is not a crash-capture problem.
+
+Note also that `check-crash-capture` uses `run0 -i find` on `/sys/fs/pstore` and
+`/var/lib/systemd/pstore`. If you dismiss or fail those polkit prompts, those
+sections print nothing — which looks identical to "no records".
 
 To read records by hand:
 
