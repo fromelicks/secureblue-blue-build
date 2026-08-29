@@ -176,11 +176,19 @@ check-crash-capture:
     # nothing and would report "0 entr(ies)" whether or not a record exists --
     # the exact false negative this check is meant to rule out. Count as root,
     # and say so when the count could not be taken.
+    #
+    # Do NOT pipe run0 into wc here: the `if` would then test wc's status, which
+    # is always 0, the else branch would be unreachable, and a dismissed polkit
+    # prompt would print a confident "0 entr(ies)" -- reintroducing the very
+    # false negative this block exists to prevent. Capture run0's own status
+    # first, then count.
     for d in /sys/fs/pstore /var/lib/systemd/pstore; do
-        if N=$(run0 -i find "$d" -type f 2>/dev/null | wc -l); then
+        if OUT=$(run0 -i find "$d" -type f 2>/dev/null); then
+            N=0
+            [ -n "$OUT" ] && N=$(printf '%s\n' "$OUT" | wc -l)
             printf '%-24s %s entr(ies)\n' "$d:" "$N"
         else
-            printf '%-24s unreadable (needs root)\n' "$d:"
+            printf '%-24s unreadable (needs root, or the polkit prompt was declined)\n' "$d:"
         fi
     done
 
