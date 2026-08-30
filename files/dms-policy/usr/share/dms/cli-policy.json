@@ -1,0 +1,9 @@
+{
+  "policy_version": 1,
+  "blocked_commands": [
+    "greeter install",
+    "greeter enable",
+    "greeter uninstall"
+  ],
+  "message": "System-level DMS operations remain disabled on this immutable image."
+}

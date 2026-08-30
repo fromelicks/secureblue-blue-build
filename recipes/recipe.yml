@@ -88,6 +88,13 @@ modules:
       packages:
         - noctalia-qs
 
+  # Apply distribution policy after installing DMS so a future RPM-owned file
+  # at the same path cannot replace the image's policy.
+  - type: files
+    files:
+      - source: dms-policy
+        destination: /
+
   - type: script
     scripts:
       - install-netbird.sh

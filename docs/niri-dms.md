@@ -6,12 +6,12 @@ choice to GDM without changing the selected/default session.
 
 ## Ownership
 
-- Image: the `niri` and `dms` packages plus the system-wide
-  `niri.service.d/10-dms.conf` integration.
-- User layer (chezmoi): `~/.config/niri`, initial DMS-generated fragments, and
-  the initial `~/.config/DankMaterialShell/settings.json`.
-- Runtime: wallpaper cache, DMS state, generated output/cursor rules, and later
-  changes made through DMS settings.
+- Image: the `niri` and `dms` packages, the system-wide
+  `niri.service.d/10-dms.conf` integration, and DMS CLI policy.
+- User layer (chezmoi): a minimal `~/.config/niri/config.kdl` integration file
+  and the initial `~/.config/DankMaterialShell/settings.json`.
+- Runtime: DMS-generated fragments under `~/.config/niri/dms`, wallpaper
+  cache, DMS state, and changes made through DMS settings.
 
 The image drop-in adds `Wants=dms.service` to `niri.service`. This is the
 declarative equivalent of `systemctl --user add-wants niri.service dms` and
@@ -23,8 +23,17 @@ dependency accepts any provider of the virtual `quickshell` capability, which
 can otherwise resolve to Terra's `noctalia-qs`. That fork can render the bar,
 but its IPC target and display handling is incompatible with DMS.
 
-The DMS-owned files use chezmoi's `create_` attribute. Chezmoi creates their
-initial versions but does not overwrite later changes made by DMS.
+DMS owns its generated Niri fragments. Chezmoi contains the stable include
+points but neither seeds nor overwrites those fragments.
+
+The distro build of DMS normally blocks the entire `dms setup` command tree on
+an OSTree system. This includes the component generators even though they only
+write user configuration. The image supplies `/usr/share/dms/cli-policy.json`
+after the DMS package is installed, retaining the greeter/system-operation
+blocks while permitting the component generators. The current policy format
+cannot distinguish the interactive parent command from its component
+subcommands: do not run bare `dms setup`, because it can request privilege
+escalation and add the user to the broad `input` group.
 
 ## Rollout
 
@@ -47,6 +56,22 @@ After the image build has been published:
 3. At GDM, use the session chooser to select **Niri** for a test login. Select
    **GNOME** there to return to the normal session. No GDM default is forced by
    this configuration.
+
+   On a new profile, generate the DMS-owned fragments individually after
+   booting the image that contains the CLI policy:
+
+   ```sh
+   dms setup binds
+   dms setup layout
+   dms setup colors
+   dms setup alttab
+   dms setup outputs
+   dms setup cursor
+   dms setup windowrules
+   ```
+
+   Each generator refuses to overwrite an existing non-empty fragment. DMS
+   creates `wpblur.kdl` itself when its wallpaper-blur integration needs it.
 
 Useful initial bindings include `Super+T` for Ghostty, `Super+Space` for the
 DMS launcher, `Super+,` for DMS settings, `Super+Alt+L` to lock, and
