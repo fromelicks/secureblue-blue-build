@@ -35,6 +35,12 @@ modules:
           - name: avengemedia/dms
             chroot: fedora-44-x86_64
     install:
+      # DMS accepts any provider of the virtual `quickshell` capability. Terra's
+      # noctalia-qs also provides it, but its IPC/display handling is not
+      # compatible with DMS: the bar loads while modal IPC targets are absent.
+      # Naming quickshell explicitly selects AvengeMedia's package from the
+      # dms COPR dependency repository instead of the Noctalia fork.
+      allow-erasing: true
       packages:
         - chezmoi
         - clang
@@ -61,6 +67,7 @@ modules:
         - mise
         - nushell # repo: files:fury-nushell.repo
         - niri
+        - quickshell # repo: coprdep:copr.fedorainfracloud.org:avengemedia:danklinux
         - rclone
         - sbcl
         - syncthing
@@ -73,10 +80,13 @@ modules:
           packages:
             - terra-release
             - terra-gpg-keys
-    # remove: # Example removal
-    #   packages:
-    #     - firefox
-    #     - firefox-langpacks
+    remove:
+      # It owns /usr/bin/qs and must not remain alongside AvengeMedia's
+      # quickshell. This also cleans up images built before quickshell was
+      # selected explicitly.
+      auto-remove: false
+      packages:
+        - noctalia-qs
 
   - type: script
     scripts:

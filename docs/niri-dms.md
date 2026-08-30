@@ -18,6 +18,11 @@ declarative equivalent of `systemctl --user add-wants niri.service dms` and
 does not globally enable DMS. In particular, DMS does not start in GNOME or in
 GDM's greeter user manager.
 
+The recipe installs AvengeMedia's `quickshell` package explicitly. DMS's RPM
+dependency accepts any provider of the virtual `quickshell` capability, which
+can otherwise resolve to Terra's `noctalia-qs`. That fork can render the bar,
+but its IPC target and display handling is incompatible with DMS.
+
 The DMS-owned files use chezmoi's `create_` attribute. Chezmoi creates their
 initial versions but does not overwrite later changes made by DMS.
 
@@ -68,6 +73,15 @@ From a Niri session:
 niri validate
 systemctl --user status niri.service dms.service
 niri msg outputs
+dms doctor -v
+dms ipc call spotlight toggle
+```
+
+`dms doctor -v` should report `Quickshell 0.3.1` from AvengeMedia's COPR, not
+`noctalia-qs`. Verify the selected provider with:
+
+```sh
+rpm -q quickshell noctalia-qs
 ```
 
 On this hybrid Intel/NVIDIA machine, leave the render device automatic first.
