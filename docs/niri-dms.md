@@ -92,6 +92,12 @@ and log out and back in.
 
 ## Checks
 
+An intermittent boot-time HDA/PipeWire failure was first noticed after entering
+Niri, but was subsequently reproduced in GNOME and cleared by rebooting. If
+speaker audio is quiet, noisy, or choppy, do not assume DMS is responsible;
+follow [`hda-pipewire-xruns.md`](hda-pipewire-xruns.md) before changing the
+Niri or DMS configuration.
+
 From a Niri session:
 
 ```sh
