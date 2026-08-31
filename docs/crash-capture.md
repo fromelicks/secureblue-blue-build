@@ -308,6 +308,19 @@ would rather find a flaw now than after the next real one, force a panic.
 matters, and expect to lose anything still in the page cache that the sync does
 not catch.
 
+First confirm the dump will not be truncated, or the test only reproduces a bug
+you already know about:
+
+```bash
+ujust check-crash-capture | grep dumps
+# want: record_size=32768 > pstore.kmsg_bytes=10240 (a crash fits in one record)
+```
+
+If that line reports `record_size=4096`, the modprobe.d drop-in has not reached
+this deployment yet and the panic will be stored as part 1 only — you would lose
+the `Oops:` header, the process name and the faulting `RIP`, which is most of
+what the test is meant to prove. Update first.
+
 ```bash
 run0 --pipe bash -c 'echo s > /proc/sysrq-trigger'
 journalctl -k -n5 | grep "Emergency Sync complete"    # wait for this
@@ -348,20 +361,30 @@ That is expected, not a fault.
 
 Caveats, in the order they are likely to bite:
 
-- **`sysrq-c` is not in the keyboard mask.**
+- **`sysrq-c` is not in the keyboard mask, and does not need to be.**
   `etc/sysctl.d/99-sysrq-debug.conf` sets `kernel.sysrq = 176` (sync 16 +
-  remount-ro 32 + reboot 128); the crash key needs the debug-dump bit (8). That
-  mask governs the *keyboard* combination. Writes to `/proc/sysrq-trigger` are
-  supposed to bypass it — `write_sysrq_trigger()` calls `__handle_sysrq()` with
-  mask checking off — which is why the recipe above uses the trigger file and not
-  Alt+SysRq. Untested here.
-- **If the trigger write does nothing, do not just raise the mask.**
-  `99-sysrq-debug.conf` states that memory-dump and kernel-debug keys are blocked
-  by `lockdown=confidentiality` regardless of the mask, and lockdown is on
-  `/proc/cmdline`. Whether that covers `c` specifically has not been established.
-  If it does, raising `kernel.sysrq` to 184 achieves nothing while widening the
-  mask, so establish which of the two is stopping it before changing anything —
-  check `dmesg` for a lockdown denial after the write.
+  remount-ro 32 + reboot 128); the crash key needs the debug-dump bit (8), which
+  is absent. That mask governs the *keyboard* combination.
+  `write_sysrq_trigger()` calls `__handle_sysrq()` with mask checking off, so
+  writes to `/proc/sysrq-trigger` bypass it — which is why the recipe uses the
+  trigger file and not Alt+SysRq.
+
+  Verified without crashing anything, using `m` (show-memory): it gates on the
+  same `SYSRQ_ENABLE_DUMP` bit as `c` but only prints statistics.
+
+  ```bash
+  $ run0 --pipe bash -c 'echo m > /proc/sysrq-trigger'
+  $ dmesg | head -2
+  sysrq: Show Memory
+  Mem-Info:
+  ```
+
+  It fired with bit 8 clear *and* `lockdown=confidentiality` on `/proc/cmdline`,
+  so neither the mask nor lockdown blocks dump-class sysrq through the trigger
+  file. Do **not** raise `kernel.sysrq` to 184 to "enable" the crash key; it is
+  not what is gating anything, and it would widen the keyboard mask for nothing.
+  Re-run the `m` probe if you ever doubt it — it is the cheap version of the
+  whole question.
 - **ramoops is best-effort even when everything is configured.** A deliberate
   panic is the most favourable case — the kernel reaches its panic handler
   cleanly. A pass here does not guarantee capture from a firmware-level reset.
