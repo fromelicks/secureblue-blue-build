@@ -3,8 +3,7 @@
 # Uses bootc, NOT rpm-ostree. Only bootc reads /usr/lib/bootc/kargs.d/, so an
 # rpm-ostree deployment silently drops every kernel argument the recipe declares
 # -- and because bootc applies kargs.d as a delta against the booted deployment,
-# a karg first shipped under an rpm-ostree deployment is then unreachable
-# forever. That is what stranded the ramoops crash-capture kargs for days.
+# a karg first shipped under an rpm-ostree deployment is then unreachable forever.
 # See docs/kernel-arguments.md.
 #
 # `run0 -i` is deliberate: /usr/bin/bootc is labelled install_exec_t and run0's
@@ -22,12 +21,5 @@ update-fromelicks:
     if [[ "$CURRENT" == "$TARGET" ]]; then
         run0 -i bootc upgrade
     else
-        # --enforce-container-sigpolicy is NOT the default. Without it the origin
-        # is rewritten from ostree-image-signed: to ostree-unverified-image:,
-        # dropping cosign verification on this update and every one after.
         run0 -i bootc switch --enforce-container-sigpolicy "$REF"
     fi
-    echo ""
-    echo "Staged. After rebooting, verify any new kernel argument actually landed:"
-    echo "    grep -o '<karg>' /proc/cmdline"
-    echo "The recipe -> cmdline path fails silently; see docs/kernel-arguments.md."
