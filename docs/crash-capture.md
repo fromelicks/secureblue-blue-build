@@ -215,6 +215,34 @@ Two things to note about that file:
 - Changing `record_size` changes the zone geometry, so the first boot after it
   ships reformats the region and logs `ramoops: error in header`. Any record not
   yet archived at that point is discarded. Harmless once, expected once.
+- **The kernel command line beats modprobe.d.** kmod parses `/proc/cmdline`
+  itself — that is how `ramoops.mem_name=` and `ramoops.ecc=` reach a *loadable*
+  module — and it emits modprobe.d options first, cmdline options last.
+  `module_param` takes the last assignment, so a `ramoops.record_size=` karg
+  would silently override this file. Verified:
+
+  ```
+  $ modprobe -C <dir with 'options ramoops record_size=32768 ecc=99'> -c | grep ramoops
+  options ramoops record_size=32768 ecc=99   # the file
+  options ramoops mem_name=oops              # /proc/cmdline
+  options ramoops ecc=1                      # /proc/cmdline -- this one wins
+  ```
+
+  Nothing sets `record_size` on the cmdline today. But note that a BLS
+  `x-options-source` pin survives deletion from the recipe, so a karg can
+  outlive the recipe line that introduced it and quietly win from there.
+
+### Why the other ramoops settings stay kargs
+
+Only `record_size` moved, and the split is the real boundary rather than an
+inconsistency:
+
+| setting | where | why |
+|---|---|---|
+| `reserve_mem=2M:4096:oops` | karg | core kernel early-boot reservation; absent from `/sys/module/ramoops/parameters/`, and it must happen before any module loads |
+| `ramoops.mem_name=oops` | karg | a real module param, but coupled to `reserve_mem` by the literal string `oops` — keeping the pair adjacent stops a rename half-applying |
+| `ramoops.ecc=1` | karg | a real module param; could move, but would be a no-op while the BLS pin keeps it on the cmdline, since the cmdline wins |
+| `ramoops.record_size` | modprobe.d | never was a karg — it sat at the 4096 default, and nothing on the cmdline contests it |
 
 Raising `pstore.kmsg_bytes` above 10240 is worth considering as well — the
 `Modules linked in` list alone is about 3.5 KiB of that budget, and it is printed
