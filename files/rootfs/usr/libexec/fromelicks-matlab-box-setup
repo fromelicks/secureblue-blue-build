@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+#
+# First-start setup for the MATLAB distrobox. Invoked as an init_hook from
+# /etc/distrobox/matlab.ini, so it runs as root INSIDE the container on every
+# container start -- it must therefore be idempotent and cheap once complete.
+#
+# Two separate stamps, because the two halves of the install have different
+# lifetimes: MATLAB itself lives on a host volume and survives
+# `distrobox rm`, while the apt dependencies live in the container's own
+# filesystem and do not. Keying both off one stamp would silently skip the
+# dependency install after a container replace and leave MATLAB unable to
+# start.
+#
+# Output discipline matters here. distrobox-enter watches the container log
+# and gives three prefixes meaning: `distrobox:` is progress, `Error:` is
+# fatal and aborts the enter, everything else is discarded silently
+# (/usr/bin/distrobox-enter:739-760). So progress goes to stdout with the
+# `distrobox:` prefix, real failures use `Error:` deliberately, and the
+# torrent of apt/mpm output goes to the log file ONLY -- one stray `Error:`
+# line from mpm would otherwise kill `distrobox enter` while the install
+# carried on in the background.
+
+set -euo pipefail
+
+readonly RELEASE='R2026a'
+readonly RELEASE_LC='r2026a'
+readonly DEST="/opt/matlab/${RELEASE}"
+readonly MATLAB_STAMP="/opt/matlab/.installed-${RELEASE}"
+readonly PARTIAL_MARKER="/opt/matlab/.installing-${RELEASE}"
+readonly DEPS_STAMP="/var/lib/fromelicks-matlab-deps-${RELEASE}"
+readonly LOG='/opt/matlab/setup.log'
+readonly MPM_URL='https://www.mathworks.com/mpm/glnxa64/mpm'
+readonly DEPS_URL="https://raw.githubusercontent.com/mathworks-ref-arch/container-images/main/matlab-deps/${RELEASE_LC}/ubuntu24.04/base-dependencies.txt"
+
+log() { printf 'distrobox: matlab-box: %s\n' "$*"; }
+fail() { printf 'Error: matlab-box: %s (see %s)\n' "$*" "${LOG}" >&2; exit 1; }
+
+# Strip comments, CR and blank lines. Applied to the fetched dependency list as
+# well as the local product list: the former comes from a third-party branch,
+# and an unexpected header line or CRLF would otherwise reach apt-get as a
+# package name, fail the hook, and -- because the stamp is never written --
+# fail it identically on every subsequent start.
+clean_list() { sed -e 's/#.*//' -e 's/\r//g' -e '/^[[:space:]]*$/d' "$1"; }
+
+if [[ -f "${MATLAB_STAMP}" && -f "${DEPS_STAMP}" ]]; then
+    exit 0
+fi
+
+mkdir -p /opt/matlab
+# One previous log is kept; `tee -a` across every re-run grew without bound.
+[[ -f "${LOG}" ]] && mv -f "${LOG}" "${LOG}.prev"
+: > "${LOG}"
+log "starting setup at $(date -Is)"
+
+# ── MathWorks' own dependency list for this release ────────────────────────
+# Fetched rather than vendored: it is release- and distro-specific, changes
+# with every release, and the first run needs the network anyway.
+if [[ ! -f "${DEPS_STAMP}" ]]; then
+    log 'fetching the MathWorks dependency list'
+    deps_list="$(mktemp)"
+    curl -sSfL --retry 3 "${DEPS_URL}" -o "${deps_list}" \
+        || fail "could not fetch ${DEPS_URL}"
+    mapfile -t deps < <(clean_list "${deps_list}")
+    rm -f "${deps_list}"
+    (( ${#deps[@]} )) || fail 'the dependency list came back empty'
+
+    log "installing ${#deps[@]} dependency packages"
+    export DEBIAN_FRONTEND=noninteractive
+    { apt-get update -qq &&
+      apt-get install -y --no-install-recommends "${deps[@]}"; } >> "${LOG}" 2>&1 \
+        || fail 'the dependency install failed'
+
+    # No locale-gen here: distrobox-init already patches /etc/locale.gen and
+    # runs locale-gen + update-locale for the host locale before this hook.
+
+    mkdir -p "$(dirname "${DEPS_STAMP}")"
+    touch "${DEPS_STAMP}"
+fi
+
+# ── MATLAB and the products ────────────────────────────────────────────────
+if [[ ! -f "${MATLAB_STAMP}" ]]; then
+    # mpm cannot resume, and re-running it over a half-written destination
+    # produces a subtly broken install rather than an error. Refuse instead,
+    # and let the user decide to throw away a partial multi-hour download.
+    if [[ -e "${PARTIAL_MARKER}" ]]; then
+        fail "a previous install of ${RELEASE} did not finish; run 'ujust reset-matlab-install'"
+    fi
+
+    # The product set is per-machine -- which hardware support packages are
+    # worth installing depends on the machine. Prefer the user's copy so that
+    # customising it does not edit /etc and dirty `ostree admin config-diff`.
+    home="${HOME:-}"
+    [[ -d "${home}" && "${home}" != '/root' ]] ||
+        home="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 { print $6; exit }')"
+    products_file="${home}/.config/distrobox/matlab-products.txt"
+    [[ -r "${products_file}" ]] || products_file='/run/host/etc/distrobox/matlab-products.txt'
+    [[ -r "${products_file}" ]] || fail "no product list at ${products_file}"
+
+    mapfile -t products < <(clean_list "${products_file}")
+    (( ${#products[@]} )) || fail "${products_file} lists no products"
+
+    log 'downloading MATLAB Package Manager'
+    mpm_dir="$(mktemp -d)"
+    curl -sSfL --retry 3 "${MPM_URL}" -o "${mpm_dir}/mpm" || fail 'could not download mpm'
+    chmod +x "${mpm_dir}/mpm"
+
+    log "installing ${RELEASE} with ${#products[@]} products from $(basename "${products_file}")"
+    log "this downloads tens of gigabytes; follow ${LOG} for progress"
+    touch "${PARTIAL_MARKER}"
+    # mpm resolves required products itself, so the list only names the ones
+    # actually wanted. It does not contact the license server: entitlement is
+    # checked at run time, not install time.
+    "${mpm_dir}/mpm" install \
+        --release="${RELEASE}" \
+        --destination="${DEST}" \
+        --products "${products[@]}" >> "${LOG}" 2>&1 \
+        || fail 'mpm failed; run "ujust reset-matlab-install" before retrying'
+    rm -rf "${mpm_dir}"
+
+    [[ -x "${DEST}/bin/matlab" ]] || fail "mpm finished but ${DEST}/bin/matlab is missing"
+    rm -f "${PARTIAL_MARKER}"
+    touch "${MATLAB_STAMP}"
+fi
+
+# ── Host-visible entry points ──────────────────────────────────────────────
+# These live in the container filesystem, so they are rebuilt after a replace
+# even when MATLAB itself was already on the volume.
+# Wrappers rather than symlinks, because of LD_PRELOAD. secureblue preloads
+# hardened_malloc into every host process via
+# /usr/lib/environment.d/40-hardened_malloc.conf and /etc/profile.d, and
+# `distrobox enter` forwards nearly the whole host environment into the
+# container -- its blocklist covers HOME/PATH/SHELL/XDG_*, not LD_PRELOAD.
+# Those libraries do not exist on Ubuntu, and the value contains a space that
+# distrobox interpolates unquoted. Dropping it at the door is cheaper than
+# fighting either problem.
+for tool in matlab mex mbuild; do
+    [[ -x "${DEST}/bin/${tool}" ]] || continue
+    cat > "/usr/local/bin/${tool}" <<WRAPPER
+#!/usr/bin/env bash
+unset LD_PRELOAD
+exec "${DEST}/bin/${tool}" "\$@"
+WRAPPER
+    chmod 0755 "/usr/local/bin/${tool}"
+done
+
+# mpm is a silent product installer and creates no desktop integration, but
+# `exported_apps=matlab` in the manifest needs a matlab.desktop to export.
+icon_target='/usr/share/icons/hicolor/256x256/apps/matlab.png'
+icon_name='applications-science'
+if [[ -f "${icon_target}" ]]; then
+    icon_name='matlab'
+elif [[ -d "${DEST}" ]]; then
+    # Only on a container replace, and only until it lands: the tree is large
+    # enough that a no-match walk is worth not repeating.
+    icon_source="$(find "${DEST}/toolbox/shared" "${DEST}/resources" \
+        -name 'matlab_icon*.png' -print -quit 2>/dev/null || true)"
+    if [[ -n "${icon_source}" ]]; then
+        mkdir -p "$(dirname "${icon_target}")"
+        install -m 0644 "${icon_source}" "${icon_target}"
+        icon_name='matlab'
+    fi
+fi
+
+# No %f and no MimeType: `matlab -desktop <path>` is not a thing -- MATLAB
+# opens files through -r/-batch, so registering it as a .m handler produces a
+# launch that silently never opens a window.
+#
+# StartupWMClass is set deliberately, even though the value is a guess.
+# distrobox-export appends `StartupWMClass=matlab` to the exported copy
+# whenever the key is absent (/usr/bin/distrobox-export:574-577), and that is
+# never right; MATLAB's real class is the window title. Setting it here
+# suppresses that injection. Academic licences append " - academic use" --
+# read the truth off a running window with `xprop WM_CLASS` and correct it.
+mkdir -p /usr/share/applications
+cat > /usr/share/applications/matlab.desktop <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=MATLAB ${RELEASE}
+GenericName=Numerical Computing Environment
+Comment=MATLAB and Simulink
+Exec=/usr/local/bin/matlab -desktop
+Icon=${icon_name}
+Terminal=false
+Categories=Development;Science;Math;IDE;
+Keywords=matlab;simulink;stateflow;simscape;
+StartupNotify=true
+StartupWMClass=MATLAB ${RELEASE}
+DESKTOP
+
+log "setup complete at $(date -Is)"
