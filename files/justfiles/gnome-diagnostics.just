@@ -161,6 +161,29 @@ check-crash-capture:
     else
         echo "module:  NOT loaded"
     fi
+    # ramoops keeps only Part 1 of a dump: fs/pstore/ram.c returns -ENOSPC for
+    # record->part != 1. pstore_dump() splits a crash into ceil(kmsg_bytes /
+    # record_size) parts, so unless one record exceeds kmsg_bytes the *header* --
+    # the "Oops:"/"BUG:" line, Comm/PID naming the process, the faulting RIP and
+    # the top stack frames -- lands in part 2 and is dropped, leaving only the
+    # tail of the backtrace. The 2026-08-31 skb_clone panic was lost this way.
+    # record_size is 0400, so it needs root; kmsg_bytes is world-readable.
+    KB=$(cat /sys/module/pstore/parameters/kmsg_bytes 2>/dev/null || echo '?')
+    # Check the two numbers are actually numbers before comparing them: an
+    # empty or non-numeric read must report "unknown", never fall through to
+    # the reassuring branch.
+    if RS=$(run0 -i cat /sys/module/ramoops/parameters/record_size 2>/dev/null); then
+        RS=${RS//[^0-9]/}
+        if [ -z "$RS" ] || [ "$KB" = "?" ]; then
+            echo "dumps:   record_size='$RS' kmsg_bytes='$KB' -- could not read both, sizing UNKNOWN"
+        elif [ "$RS" -le "$KB" ]; then
+            echo "dumps:   record_size=$RS <= pstore.kmsg_bytes=$KB  ** dumps split; only part 1 is kept, expect 'writing error (-28)' **"
+        else
+            echo "dumps:   record_size=$RS > pstore.kmsg_bytes=$KB (a crash fits in one record)"
+        fi
+    else
+        echo "dumps:   record_size unreadable (needs root, or the polkit prompt was declined); pstore.kmsg_bytes=$KB"
+    fi
     echo ""
     echo "--- pstore ---"
     echo "mount:   $(findmnt -no OPTIONS /sys/fs/pstore 2>/dev/null || echo 'not mounted')"
