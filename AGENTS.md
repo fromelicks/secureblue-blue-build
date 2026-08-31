@@ -103,6 +103,15 @@ These gate multiple features. Verified against secureblue source.
     against `/proc/sys`, and `audit_utils.validate_sysctl` has no special case for
     `kernel.panic`, so it falls through to exact equality. That one line is the accepted
     trade; any *other* sysctl finding in that check is real and must be investigated.
+    Capture is armed but **lossy by default**: ramoops accepts only part 1 of a
+    dump (`fs/pstore/ram.c` returns `-ENOSPC` for `part != 1`), and part 1 is the
+    *oldest* slice, so with `record_size=4096` under `pstore.kmsg_bytes=10240` the
+    `Oops:` line, the `Comm`/PID naming the process, the faulting `RIP` and the top
+    frames are all discarded — exactly what the 2026-08-31 `skb_clone` panic lost.
+    Fixed with `options ramoops record_size=32768` in
+    `files/rootfs/etc/modprobe.d/ramoops-record-size.conf`; keep it a modprobe.d
+    option rather than a karg, since ramoops is a module and this avoids
+    constraint 13 entirely.
     See [`docs/crash-capture.md`](docs/crash-capture.md).
 11. **`systemd.user.enabled` in the recipe enables units GLOBALLY**, via
     `/etc/systemd/user/default.target.wants/`. GDM's greeter runs a full systemd user

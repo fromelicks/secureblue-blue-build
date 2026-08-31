@@ -166,6 +166,67 @@ Wants=modprobe@ramoops.service
 After=modprobe@ramoops.service
 ```
 
+### ramoops keeps only part 1 of a dump
+
+Found the hard way on **2026-08-31**, when the chain above finally fired for
+real. A panic in `skb_clone` was captured, archived, and survived the reboot —
+the feature worked. It was still not enough to identify the crash, and the
+records said why:
+
+```
+pstore: backend (ramoops) writing error (-28)
+```
+
+`-28` is `ENOSPC`, but nothing had run out of space: the region is 2 MiB and each
+record held about 6 KB. `fs/pstore/ram.c` returns `-ENOSPC` for any record whose
+part number is not 1, on an assumption its own comment states — that one record
+is larger than pstore's per-dump budget. That assumption did not hold here.
+`pstore.kmsg_bytes` is 10240 and ramoops' default `record_size` is 4096, so
+`pstore_dump()` split each crash into three parts and ramoops accepted only the
+first.
+
+Part 1 is the *oldest* slice of the dump, so what survived was the **tail** of the
+backtrace. Everything that identifies a crash is at the top and was dropped:
+
+| In part 1 (kept) | In part 2 (lost) |
+|---|---|
+| lower stack frames, `Modules linked in`, `end trace` | `Oops:` / `BUG:` line |
+| register dump, `Kernel panic - not syncing` | `CPU`/`PID`/**`Comm`** — the process name |
+| | faulting `RIP` and the top stack frames |
+
+So the 2026-08-31 panic is diagnosable down to "`skb_clone` on a corrupt `skb`,
+in softirq, during local delivery of a locally-generated UDP packet" — and no
+further. Which process triggered it is not recoverable from what was stored.
+
+The fix is the condition `ram.c` already assumes: make one record bigger than
+`kmsg_bytes`, in `files/rootfs/etc/modprobe.d/ramoops-record-size.conf`:
+
+```
+options ramoops record_size=32768
+```
+
+Two things to note about that file:
+
+- It is a **modprobe.d option, not a recipe karg**. ramoops is a module, so
+  modprobe applies it at load time. That sidesteps the `kargs.d` delta trap in
+  [`kernel-arguments.md`](kernel-arguments.md) entirely — no BLS surgery, no
+  `bootc`-only path, it lands on the next boot after the image updates. Do not
+  "consolidate" it into the `kargs` block.
+- Changing `record_size` changes the zone geometry, so the first boot after it
+  ships reformats the region and logs `ramoops: error in header`. Any record not
+  yet archived at that point is discarded. Harmless once, expected once.
+
+Raising `pstore.kmsg_bytes` above 10240 is worth considering as well — the
+`Modules linked in` list alone is about 3.5 KiB of that budget, and it is printed
+twice. But `pstore` is built into the kernel, not a module: `/sys/module/pstore`
+has no `initstate`, it is absent from `/proc/modules`, and
+`parameters/kmsg_bytes` is `r--r--r--`. There is no modprobe.d or runtime route
+to it, only a karg — with everything that implies. `record_size` alone is enough
+to make a dump single-part, which is the actual bug.
+
+`ujust check-crash-capture` now compares the two numbers directly, so this is
+visible before the next panic rather than after it.
+
 ## Checking and reading crash records
 
 ```bash
@@ -191,10 +252,11 @@ reserved. They stop once each zone has been written.
 Note also that `check-crash-capture` counts records with `run0 -i find` on
 `/sys/fs/pstore` and `/var/lib/systemd/pstore`. If you dismiss or fail those
 polkit prompts it reports `0 entr(ies)` — a confident false negative, not a
-blank. Its guard for this is currently dead code: the `if` tests the exit status
-of `wc -l` at the end of the pipeline, which is always 0, so the "unreadable
-(needs root)" branch can never run. Authenticate the prompts, or read the paths
-directly as root.
+blank. Its guard for this was dead code until recently — the `if` tested the
+exit status of `wc -l` at the end of the pipeline, which is always 0, so the
+"unreadable (needs root)" branch could never run. It now captures `run0`'s own
+status first and counts afterwards. Authenticate the prompts either way, or read
+the paths directly as root.
 
 To read records by hand:
 
