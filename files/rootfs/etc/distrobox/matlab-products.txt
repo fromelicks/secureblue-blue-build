@@ -1,0 +1,74 @@
+# Products installed into the MATLAB distrobox by
+# /usr/libexec/fromelicks-matlab-box-setup.
+#
+# One mpm product name per line; '#' starts a comment. Names are the exact
+# R2026a mpm identifiers -- regenerate the authoritative list with:
+#
+#   curl -sSfL https://raw.githubusercontent.com/mathworks-ref-arch/matlab-dockerfile/main/mpm-input-files/R2026a/mpm_input_r2026a.txt \
+#     | sed -n 's/^#\?product\.//p'
+#
+# mpm installs required products automatically, so MATLAB itself, MATLAB Coder,
+# Fixed-Point Designer, Control System Toolbox, DSP System Toolbox and the rest
+# of the dependency closure arrive without being named here. It does NOT check
+# entitlement at install time -- the license server decides what actually opens,
+# so anything below that is not on the license is wasted disk, not an error.
+#
+# The full Simulink product family, minus the hardware/vendor support packages
+# (those are listed commented out at the bottom; they pull vendor toolchains and
+# are useless without the matching board).
+
+MATLAB
+Simulink
+Stateflow
+SimEvents
+Requirements_Toolbox
+Simulink_3D_Animation
+Simulink_Check
+Simulink_Coder
+Simulink_Compiler
+Simulink_Control_Design
+Simulink_Coverage
+Simulink_Design_Optimization
+Simulink_Design_Verifier
+Simulink_Desktop_Real-Time
+Simulink_Fault_Analyzer
+Simulink_FMU_Builder
+Simulink_PLC_Coder
+Simulink_Real-Time
+Simulink_Report_Generator
+Simulink_Test
+
+Simscape
+Simscape_Battery
+Simscape_Driveline
+Simscape_Electrical
+Simscape_Fluids
+Simscape_Multibody
+
+# Hardware and vendor support packages -- uncomment individually if the
+# matching hardware or vendor toolchain is actually present.
+# Embedded_Coder_Support_Package_for_AMD_SoC_Devices
+# Embedded_Coder_Support_Package_for_ARM_Cortex-A_Processors
+# Embedded_Coder_Support_Package_for_ARM_Cortex-M_Processors
+# Embedded_Coder_Support_Package_for_ARM_Cortex-R_Processors
+# Embedded_Coder_Support_Package_for_BeagleBone_Black_Hardware
+# Embedded_Coder_Support_Package_for_Infineon_AURIX_TC3x_Microcontrollers
+# Embedded_Coder_Support_Package_for_Infineon_AURIX_TC4x_Microcontrollers
+# Embedded_Coder_Support_Package_for_Intel_SoC_Devices
+# Embedded_Coder_Support_Package_For_Linux_Applications
+# Embedded_Coder_Support_Package_for_Qualcomm_Hexagon_Processors
+# Simulink_3D_Animation_Interface_for_Unreal_Engine_Projects
+# Simulink_Coder_Support_Package_for_ARM_Cortex-based_VEX_Microcontroller
+# Simulink_Coder_Support_Package_for_BBC_microbit_Board
+# Simulink_Coder_Support_Package_for_BeagleBone_Blue_Hardware
+# Simulink_Coder_Support_Package_for_NXP_FRDM-K64F_Board
+# Simulink_Coder_Support_Package_for_NXP_FRDM-KL25Z_Board
+# Simulink_Coder_Support_Package_for_VEX_EDR_V5_Robot_Brain
+# Simulink_Interface_for_Siemens_MF-Tyre/MF-Swift_Tire_Model
+# Simulink_Real-Time_Support_Package_for_Linux_Devices
+# Simulink_Real-Time_XIL_Support_Package
+# Simulink_Support_Package_for_Android_Devices
+# Simulink_Support_Package_for_Arduino_Hardware
+# Simulink_Support_Package_for_LEGO_MINDSTORMS_EV3_Hardware
+# Simulink_Support_Package_for_Parrot_Minidrones
+# Simulink_Test_Support_Package_for_ASAM_XIL
