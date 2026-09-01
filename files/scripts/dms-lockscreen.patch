@@ -1,0 +1,44 @@
+--- a/Modules/Lock/LockScreenContent.qml
++++ b/Modules/Lock/LockScreenContent.qml
+@@ -97,6 +97,15 @@
+         return !demoMode && pam && pam.u2f && pam.u2f.available && SettingsData.enableU2f && SettingsData.u2fMode === "or" && !pam.passwd.active && !pam.u2f.active && !pam.u2fPending && !root.unlocking;
+     }
+ 
++    function canSubmitPassword() {
++        // Submitting an empty buffer spends a PAM attempt that cannot succeed,
++        // pushing the session towards a faillock lockout for nothing. The
++        // exception is a PAM stack DMS does not own: there the conversation
++        // itself may prompt (inline u2f/fprint), so an empty response is
++        // meaningful and Enter is how the user starts it.
++        return passwordBuffer.length > 0 || SettingsData.lockPamExternallyManaged || (pam && pam.customPamActive);
++    }
++
+     Component.onCompleted: {
+         WeatherService.addRef();
+         UserInfoService.getUserInfo();
+@@ -927,7 +936,7 @@
+                         activeFocusOnTab: !demoMode
+                         onTextChanged: cursorPosition = text.length
+                         onAccepted: {
+-                            if (!demoMode && !root.unlocking && !pam.passwd.active && !pam.u2fPending) {
++                            if (!demoMode && !root.unlocking && !pam.passwd.active && !pam.u2fPending && root.canSubmitPassword()) {
+                                 pam.passwd.start();
+                             }
+                         }
+@@ -987,6 +996,7 @@
+                                     event.accepted = true;
+                                     return;
+                                 case Qt.Key_W:
++                                case Qt.Key_Backspace:
+                                     deleteWordBackward();
+                                     event.accepted = true;
+                                     return;
+@@ -1322,7 +1332,7 @@
+                         visible: (demoMode || (!pam.passwd.active && !root.unlocking && !pam.u2fPending))
+                         enabled: !demoMode
+                         onClicked: {
+-                            if (!demoMode && !root.unlocking && !pam.u2fPending) {
++                            if (!demoMode && !root.unlocking && !pam.u2fPending && root.canSubmitPassword()) {
+                                 pam.passwd.start();
+                             }
+                         }

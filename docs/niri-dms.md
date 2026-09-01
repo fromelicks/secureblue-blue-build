@@ -7,9 +7,11 @@ choice to GDM without changing the selected/default session.
 ## Ownership
 
 - Image: the `niri` and `dms` packages, the system-wide
-  `niri.service.d/10-dms.conf` integration, and DMS CLI policy.
+  `niri.service.d/10-dms.conf` integration, DMS CLI policy, and the
+  lock-screen QML patch.
 - User layer (chezmoi): a minimal `~/.config/niri/config.kdl` integration file
-  and the initial `~/.config/DankMaterialShell/settings.json`.
+  (including all touchpad/libinput settings, which belong to Niri and have no
+  DMS equivalent) and the initial `~/.config/DankMaterialShell/settings.json`.
 - Runtime: DMS-generated fragments under `~/.config/niri/dms`, wallpaper
   cache, DMS state, and changes made through DMS settings.
 
@@ -34,6 +36,57 @@ blocks while permitting the component generators. The current policy format
 cannot distinguish the interactive parent command from its component
 subcommands: do not run bare `dms setup`, because it can request privilege
 escalation and add the user to the broad `input` group.
+
+## Lock-screen patch
+
+Two defects in `Modules/Lock/LockScreenContent.qml` as shipped in DMS 1.5.3.
+
+**Empty submit spends a PAM attempt.** Enter (or the enter button) on an empty
+password field calls `pam.passwd.start()`. It cannot succeed, and it consumes a
+`pam_faillock` attempt, so a stray Enter moves the session towards a real
+lockout for nothing. A new `canSubmitPassword()` guards both submit paths.
+
+The guard is deliberately not unconditional. It still allows an empty submit
+when `lockPamExternallyManaged` is set or a custom `lockPamPath` is active,
+because there DMS is not driving the stack: the PAM conversation itself may
+prompt for an inline u2f or fingerprint touch, and Enter is how the user starts
+it. DMS's own u2f path is unaffected either way — upstream resolved that with a
+dedicated `lockScreenSecurityKeyShortcut` (issue #2982), not with bare Enter.
+This machine runs the bundled `dankshell` PAM stack with u2f and fingerprint
+off, so the guard always applies here.
+
+Still present on upstream master as of 2026-09-01. Reported previously as a
+different symptom in upstream #1430 ("Login screen loads forever on empty
+password").
+
+**Ctrl+Backspace deletes one character.** It is missing from the Ctrl branch of
+the key handler, so it falls through to the plain Backspace case. `Ctrl+W`
+already does the word delete; this gives it the conventional GUI binding.
+
+This one is **already fixed upstream** in `262acda3`, *"fix(lock): handle
+ctrl-backspace"* (2026-08-18, issue #3087) — upstream classified it as a bug and
+landed the same change. It is not in v1.5.3 (tagged 2026-07-27), which is why
+the image still carries it. **Drop this hunk** once the image picks up a DMS
+newer than 1.5.3.
+
+### Mechanics
+
+`files/scripts/patch-dms-lockscreen.sh` applies
+`files/scripts/dms-lockscreen.patch` after the dnf module installs `dms`, so
+every build patches the version it shipped. The patch applies with
+`--forward -F0`: a DMS release that reworks these hunks fails the build rather
+than silently dropping the fix or corrupting the file. When that happens,
+refresh the patch against the new source, or drop the hunks that landed
+upstream.
+
+`/usr/share/quickshell/dms` is RPM-owned, so `rpm -V dms` reports
+`Modules/Lock/LockScreenContent.qml` as modified. That is expected and is the
+only entry it should report.
+
+Touchpad settings are *not* part of this: every libinput setting belongs to
+Niri's `input {}` block in the chezmoi-managed `~/.config/niri/config.kdl`, and
+DMS exposes none of them. Niri's touchpad gestures (three-finger workspace
+switch, four-finger overview) are hardcoded and not rebindable.
 
 ## Rollout
 

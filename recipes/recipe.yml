@@ -68,6 +68,7 @@ modules:
         - nushell # repo: files:fury-nushell.repo
         - niri
         - quickshell # repo: coprdep:copr.fedorainfracloud.org:avengemedia:danklinux
+        - qt6-qtdeclarative-devel # ships qmllint-qt6 for DMS's `make lint-qml`
         - rclone
         - sbcl
         - syncthing
@@ -94,6 +95,10 @@ modules:
     files:
       - source: dms-policy
         destination: /
+
+  - type: script
+    scripts:
+      - patch-dms-lockscreen.sh # See docs/niri-dms.md.
 
   - type: script
     scripts:
