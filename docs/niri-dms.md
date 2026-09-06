@@ -39,7 +39,8 @@ escalation and add the user to the broad `input` group.
 
 ## Lock-screen patch
 
-Two defects in `Modules/Lock/LockScreenContent.qml` as shipped in DMS 1.5.3.
+One defect in `Modules/Lock/LockScreenContent.qml`, not yet fixed upstream as
+of DMS 1.6.0.
 
 **Empty submit spends a PAM attempt.** Enter (or the enter button) on an empty
 password field calls `pam.passwd.start()`. It cannot succeed, and it consumes a
@@ -55,19 +56,25 @@ dedicated `lockScreenSecurityKeyShortcut` (issue #2982), not with bare Enter.
 This machine runs the bundled `dankshell` PAM stack with u2f and fingerprint
 off, so the guard always applies here.
 
-Still present on upstream master as of 2026-09-01. Reported previously as a
+Still present on upstream master as of 2026-09-06. Reported previously as a
 different symptom in upstream #1430 ("Login screen loads forever on empty
 password").
 
-**Ctrl+Backspace deletes one character.** It is missing from the Ctrl branch of
-the key handler, so it falls through to the plain Backspace case. `Ctrl+W`
-already does the word delete; this gives it the conventional GUI binding.
+`canSubmitPassword()` is anchored right after upstream's own
+`securityKeyShortcutMatches()`, the last function DMS defines before
+`Component.onCompleted` in that block. DMS 1.6.0 added
+`triggerSecurityKeyUnlock()` and `securityKeyShortcutMatches()` at the exact
+spot this hunk used to target (straight after `canStartSecurityKeyUnlock()`),
+which broke the 1.5.3-era patch on 2026-09-04's build — re-anchor here again
+if a future release adds another function in the same place.
 
-This one is **already fixed upstream** in `262acda3`, *"fix(lock): handle
-ctrl-backspace"* (2026-08-18, issue #3087) — upstream classified it as a bug and
-landed the same change. It is not in v1.5.3 (tagged 2026-07-27), which is why
-the image still carries it. **Drop this hunk** once the image picks up a DMS
-newer than 1.5.3.
+A second defect this patch used to carry — **Ctrl+Backspace deletes one
+character** instead of the previous word, because it fell through to the
+plain-Backspace case in the Ctrl branch of the key handler — was **fixed
+upstream** in `262acda3`, *"fix(lock): handle ctrl-backspace"* (2026-08-18,
+issue #3087), and shipped in DMS 1.6.0 (`case Qt.Key_W: case
+Qt.Key_Backspace:` is now stock). That hunk is gone from
+`dms-lockscreen.patch`; do not re-add it.
 
 ### Mechanics
 
@@ -77,7 +84,9 @@ every build patches the version it shipped. The patch applies with
 `--forward -F0`: a DMS release that reworks these hunks fails the build rather
 than silently dropping the fix or corrupting the file. When that happens,
 refresh the patch against the new source, or drop the hunks that landed
-upstream.
+upstream. This is exactly what happened between 1.5.3 and 1.6.0: the scheduled
+build failed daily from 2026-09-04 through 2026-09-06 until the patch was
+rebased against 1.6.0's source layout (see above).
 
 `/usr/share/quickshell/dms` is RPM-owned, so `rpm -V dms` reports
 `Modules/Lock/LockScreenContent.qml` as modified. That is expected and is the

@@ -1,9 +1,9 @@
 --- a/Modules/Lock/LockScreenContent.qml
 +++ b/Modules/Lock/LockScreenContent.qml
-@@ -97,6 +97,15 @@
-         return !demoMode && pam && pam.u2f && pam.u2f.available && SettingsData.enableU2f && SettingsData.u2fMode === "or" && !pam.passwd.active && !pam.u2f.active && !pam.u2fPending && !root.unlocking;
+@@ -110,6 +110,15 @@
+         return SettingsData.lockScreenSecurityKeyShortcutEnabled && KeyUtils.eventMatchesCombo(event, SettingsData.lockScreenSecurityKeyShortcut);
      }
- 
+
 +    function canSubmitPassword() {
 +        // Submitting an empty buffer spends a PAM attempt that cannot succeed,
 +        // pushing the session towards a faillock lockout for nothing. The
@@ -16,7 +16,7 @@
      Component.onCompleted: {
          WeatherService.addRef();
          UserInfoService.getUserInfo();
-@@ -927,7 +936,7 @@
+@@ -992,7 +1001,7 @@
                          activeFocusOnTab: !demoMode
                          onTextChanged: cursorPosition = text.length
                          onAccepted: {
@@ -25,15 +25,7 @@
                                  pam.passwd.start();
                              }
                          }
-@@ -987,6 +996,7 @@
-                                     event.accepted = true;
-                                     return;
-                                 case Qt.Key_W:
-+                                case Qt.Key_Backspace:
-                                     deleteWordBackward();
-                                     event.accepted = true;
-                                     return;
-@@ -1322,7 +1332,7 @@
+@@ -1427,7 +1436,7 @@
                          visible: (demoMode || (!pam.passwd.active && !root.unlocking && !pam.u2fPending))
                          enabled: !demoMode
                          onClicked: {
