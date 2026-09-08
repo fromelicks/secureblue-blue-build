@@ -108,6 +108,7 @@ modules:
     system:
       enabled:
         - btmon-capture.service
+        - fromelicks-gdm-monitors.service
         - fromelicks-io-cost.service
         - gnome-hang-monitor.service
         - netbird.service

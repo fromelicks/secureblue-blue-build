@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Monitor layout for the GDM greeter.
+
+  Installed to /var/lib/gdm/<seat>/config/monitors.xml by
+  fromelicks-gdm-monitors.service. Mutter reads $XDG_CONFIG_HOME/monitors.xml,
+  and GDM points the greeter's XDG_CONFIG_HOME at that per-seat directory,
+  not the widely documented /var/lib/gdm/.config, which no longer exists.
+
+  Mutter matches a <configuration> only when the set of connected monitors
+  matches the block exactly, comparing all four monitorspec fields (connector,
+  vendor, product, serial). A connector rename (HDMI-5 vs DP-4) is therefore a
+  different block, which is why the external panel is listed on every port it
+  has been plugged into. With no matching block mutter falls back to its
+  built-in default (every output enabled, laptop panel primary), so unplugging
+  the external display still leaves a usable greeter on eDP-1.
+
+  Keep this in sync with the session layout in ~/.config/monitors.xml.
+  See docs/gdm-external-monitor.md.
+-->
+<monitors version="2">
+  <!-- External on HDMI (NVIDIA card0-HDMI-A-5), laptop panel on the shelf. -->
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>HDMI-5</connector>
+          <vendor>CHD</vendor>
+          <product>24MC635</product>
+          <serial>0x00000000</serial>
+        </monitorspec>
+        <mode>
+          <width>1920</width>
+          <height>1080</height>
+          <rate>75.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+    <disabled>
+      <monitorspec>
+        <connector>eDP-1</connector>
+        <vendor>AUO</vendor>
+        <product>0xc1a5</product>
+        <serial>0x0000c1a5</serial>
+      </monitorspec>
+    </disabled>
+  </configuration>
+
+  <!-- Same display over DisplayPort. -->
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>DP-4</connector>
+          <vendor>CHD</vendor>
+          <product>24MC635</product>
+          <serial>0x00000000</serial>
+        </monitorspec>
+        <mode>
+          <width>1920</width>
+          <height>1080</height>
+          <rate>75.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+    <disabled>
+      <monitorspec>
+        <connector>eDP-1</connector>
+        <vendor>AUO</vendor>
+        <product>0xc1a5</product>
+        <serial>0x0000c1a5</serial>
+      </monitorspec>
+    </disabled>
+  </configuration>
+
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>DP-3</connector>
+          <vendor>CHD</vendor>
+          <product>24MC635</product>
+          <serial>0x00000000</serial>
+        </monitorspec>
+        <mode>
+          <width>1920</width>
+          <height>1080</height>
+          <rate>75.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+    <disabled>
+      <monitorspec>
+        <connector>eDP-1</connector>
+        <vendor>AUO</vendor>
+        <product>0xc1a5</product>
+        <serial>0x0000c1a5</serial>
+      </monitorspec>
+    </disabled>
+  </configuration>
+
+  <!-- Lid closed: eDP-1 drops off the bus entirely, so these blocks list the
+       external display alone. Without them mutter would use its default
+       (correct output, but the panel's preferred mode rather than 75 Hz). -->
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>HDMI-5</connector>
+          <vendor>CHD</vendor>
+          <product>24MC635</product>
+          <serial>0x00000000</serial>
+        </monitorspec>
+        <mode>
+          <width>1920</width>
+          <height>1080</height>
+          <rate>75.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>DP-4</connector>
+          <vendor>CHD</vendor>
+          <product>24MC635</product>
+          <serial>0x00000000</serial>
+        </monitorspec>
+        <mode>
+          <width>1920</width>
+          <height>1080</height>
+          <rate>75.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>1</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>DP-3</connector>
+          <vendor>CHD</vendor>
+          <product>24MC635</product>
+          <serial>0x00000000</serial>
+        </monitorspec>
+        <mode>
+          <width>1920</width>
+          <height>1080</height>
+          <rate>75.000</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>
