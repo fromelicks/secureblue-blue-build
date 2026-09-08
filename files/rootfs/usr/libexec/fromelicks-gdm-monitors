@@ -1,0 +1,69 @@
+#!/bin/bash
+# Install the image's monitor layout for the GDM greeter.
+#
+# The greeter draws on whatever mutter picks by default -- every connected
+# output enabled, the laptop panel primary -- unless it finds a monitors.xml of
+# its own. Placing one is the only supported way to move the login dialog to the
+# external display; there is no dconf key and no GDM configuration option.
+#
+# Two things make this non-obvious on GDM >= 48:
+#
+#   1. The greeter no longer runs as the static "gdm" account (uid 42). It runs
+#      as a *dynamic* user, and GDM sets its XDG_CONFIG_HOME to
+#      /var/lib/gdm/<seat>/config. The path every guide on the internet names,
+#      /var/lib/gdm/.config/monitors.xml, is the pre-migration location and is
+#      simply not read (see /var/lib/gdm/.migrated-dyn-users).
+#   2. /var/lib/gdm is under /var, which an ostree/bootc image only populates at
+#      install time, so the file cannot ship through the files module and has to
+#      be placed at boot instead.
+#
+# Because the greeter's uid is allocated dynamically, this makes no assumption
+# about who owns the config directory: the file is installed world-readable and
+# given the directory's own ownership, so it stays readable whether GDM has
+# chowned the directory to the dynamic user or left it to root.
+
+set -u
+
+TAG=fromelicks-gdm-monitors
+SRC=/usr/share/fromelicks/gdm-monitors.xml
+GDM_HOME=/var/lib/gdm
+
+log_info() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p info; }
+log_warn() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p warning; }
+
+install_for_seat() {
+  local seat_dir="$1" config_dir dest
+  config_dir="$seat_dir/config"
+  dest="$config_dir/monitors.xml"
+
+  if [ ! -d "$config_dir" ]; then
+    # GDM creates this itself on first start; 0755 root:root only fills in the
+    # gap on a machine that has never run the greeter. Anything stricter would
+    # risk locking out a dynamic uid that does not exist yet.
+    mkdir -p -m 0755 "$config_dir" || { log_warn "cannot create $config_dir"; return 1; }
+  fi
+
+  if cmp -s "$SRC" "$dest"; then
+    return 0
+  fi
+
+  install -m 0644 "$SRC" "$dest" || { log_warn "cannot install $dest"; return 1; }
+  chown --reference="$config_dir" "$dest" 2>/dev/null || true
+  command -v restorecon >/dev/null 2>&1 && restorecon -F "$dest" >/dev/null 2>&1
+  log_info "installed greeter monitor layout at $dest"
+}
+
+[ -r "$SRC" ] || { log_warn "$SRC is missing"; exit 0; }
+[ -d "$GDM_HOME" ] || { log_warn "$GDM_HOME is missing; is GDM installed?"; exit 0; }
+
+found=0
+for seat_dir in "$GDM_HOME"/seat*; do
+  [ -d "$seat_dir" ] || continue
+  install_for_seat "$seat_dir"
+  found=1
+done
+
+# No per-seat directory yet (greeter has never started on this machine).
+[ "$found" = 1 ] || install_for_seat "$GDM_HOME/seat0"
+
+exit 0

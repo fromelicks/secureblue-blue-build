@@ -1,0 +1,39 @@
+[Unit]
+Description=Install the GDM greeter monitor layout
+Documentation=https://github.com/fromelicks/secureblue-blue-build/blob/main/docs/gdm-external-monitor.md
+ConditionPathExists=/usr/share/fromelicks/gdm-monitors.xml
+ConditionPathIsDirectory=/var/lib/gdm
+# The greeter's mutter reads monitors.xml once, at startup, so the file has to
+# be in place before gdm.service. Both units are wanted by graphical.target, so
+# this ordering keeps them in the same transaction.
+After=local-fs.target
+Before=gdm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/fromelicks-gdm-monitors
+
+# Writes exactly one file under /var/lib/gdm and relabels it; CAP_CHOWN is for
+# matching the config directory's (possibly dynamic-uid) ownership.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gdm
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical.target
