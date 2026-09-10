@@ -1,0 +1,13 @@
+[Unit]
+Description=Deliberate heavy compute jobs (exempt from app.slice memory containment)
+Documentation=https://github.com/fromelicks/secureblue-blue-build/blob/main/docs/memory-pressure-hangs.md
+
+[Slice]
+# No MemoryHigh: jobs here are expected to exceed RAM and stream through swap
+# (`ujust heavy-run`). The desktop is protected by MemoryMin on session.slice.
+# oomd is disabled for this slice in workload.slice.d/50-fromelicks-oomd.conf.
+
+# Yields to the session and to interactive apps under contention; weights are
+# work-conserving, so an idle desktop leaves the job the whole machine.
+CPUWeight=20
+IOWeight=50
