@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+#
+# Confine a split-tunnel WireGuard profile's own address to the destinations
+# that tunnel actually routes. See docs/webrtc-vpn-ice-candidates.md.
+#
+# The failure this prevents: libwebrtc gathers an ICE host candidate on every
+# local interface. A packet from a tunnel address to a destination the tunnel
+# does not carry is routed by destination alone, so it leaves through the
+# default interface with a foreign source address and is dropped silently
+# upstream. A black-hole candidate that wins nomination is what hung Discord
+# voice at "DTLS Connecting".
+#
+# Everything lives in the NetworkManager profile, so NM adds and removes it on
+# activate, deactivate and reapply -- no dispatcher script, no state files, and
+# two profiles sharing an address cannot tear down each other's rules. Per
+# address family:
+#
+#   route-table  T                          the tunnel's routes, device and
+#                                           peer routes included, live in T
+#   rule 90      from <tunnel addr> table T the tunnel address reaches T...
+#   rule 91      from <tunnel addr> unreachable
+#                                           ...and nothing else: ENETUNREACH
+#                                           at once, so libwebrtc discards the
+#                                           candidate instead of nominating it
+#   rule 92      from all table T           everything else still reaches the
+#                                           tunnel's destinations; T has no
+#                                           default, so a miss falls through
+#
+# T is a dedicated table from a reserved range, never main. Rule 90 therefore
+# also cuts the tunnel address off from the LAN, NetBird and container routes
+# that live in main -- a "main minus the default route" rule would have left
+# those as black holes.
+#
+# The block must be a rule, not an unreachable default route inside T. A lookup
+# that lands on an unreachable route ends with that error on the spot:
+# suppress_prefixlength does not hide it and later rules are never tried. Such
+# a route in T takes every other lookup down with it through rule 92 --
+# measured while building this, not theorised.
+#
+# A family whose peers route /0 is a full tunnel and is left alone: there the
+# default route is the real path, and NM's ip4-auto-default-route already does
+# the policy routing for it.
+
+set -euo pipefail
+
+# Registered in /usr/share/iproute2/rt_tables.d/fromelicks-wg-split.conf.
+readonly TABLE_MIN=18000
+readonly TABLE_MAX=18009
+readonly PRIO_SRC=90
+readonly PRIO_BLOCK=91
+readonly PRIO_DST=92
+# Documentation prefixes (RFC 5737, RFC 3849): never legitimately routed, so a
+# lookup from a tunnel address shows whether any leak path exists.
+readonly PROBE4=192.0.2.1
+readonly PROBE6=2001:db8::1
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+state() { printf '  %-24s %s\n' "$1" "$2"; }
+
+usage() {
+    printf 'usage: %s apply CONNECTION\n' "${0##*/}" >&2
+    printf '       %s remove CONNECTION\n' "${0##*/}" >&2
+    printf '       %s status [CONNECTION...]\n' "${0##*/}" >&2
+    exit 2
+}
+
+# One nmcli field. -g escapes every ':' as '\:', i.e. every IPv6 address.
+nm_get() {
+    local v
+    v=$(LC_ALL=C nmcli -g "$2" connection show "$1") || return 1
+    printf '%s\n' "${v//\\:/:}"
+}
+
+# A list-valued field, one item per line. -g joins items with ', '.
+nm_list() {
+    local v
+    v=$(nm_get "$1" "$2")
+    [[ -n $v ]] || return 0
+    printf '%s\n' "${v//, /$'\n'}"
+}
+
+family_any() { if [[ $1 == 4 ]]; then echo 0.0.0.0/0; else echo ::/0; fi; }
+family_probe() { if [[ $1 == 4 ]]; then echo "$PROBE4"; else echo "$PROBE6"; fi; }
+in_range() { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= TABLE_MIN && $1 <= TABLE_MAX )); }
+
+join_list() {
+    local out='' x
+    for x in "$@"; do
+        [[ -n $x ]] && out+=${out:+, }$x
+    done
+    printf '%s' "$out"
+}
+
+# Ours: priority 90 or 92 pointing at a reserved table, or priority 91 with the
+# unreachable action. Parsed by token, not matched as a string -- NM reorders
+# and normalises rules (a bare 'unreachable' comes back as 'type unreachable').
+rule_is_ours() {
+    local -a tok
+    local prio='' table='' action='' i
+    read -ra tok <<< "$1"
+    for (( i = 0; i + 1 < ${#tok[@]}; i++ )); do
+        case ${tok[i]} in
+            priority) prio=${tok[i+1]} ;;
+            table|lookup) table=${tok[i+1]} ;;
+            type) action=${tok[i+1]} ;;
+        esac
+    done
+    case $prio in
+        "$PRIO_SRC"|"$PRIO_DST") in_range "$table" ;;
+        "$PRIO_BLOCK") [[ $action == unreachable ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# Every allowed-ips entry across all peers, one per line.
+peer_allowed_ips() {
+    nm_get "$1" wireguard.peers | grep -oE 'allowed-ips=[^ ,]*' \
+        | cut -d= -f2 | tr ';' '\n' | sed '/^$/d' || true
+}
+
+# Why a family cannot be confined; prints nothing if it can.
+unconfinable_reason() {
+    local con=$1 fam=$2 p any method gw table r
+    p=ipv$fam
+    any=$(family_any "$fam")
+
+    method=$(nm_get "$con" "$p.method")
+    if [[ $method != manual ]]; then
+        echo "method is '$method', no static tunnel address"
+        return
+    fi
+    if [[ -z $(nm_list "$con" "$p.addresses") ]]; then
+        echo 'no addresses'
+        return
+    fi
+    if peer_allowed_ips "$con" | grep -qxF "$any"; then
+        echo "full tunnel: a peer routes $any"
+        return
+    fi
+    gw=$(nm_get "$con" "$p.gateway")
+    if [[ -n $gw ]]; then
+        echo "full tunnel: $p.gateway is $gw"
+        return
+    fi
+    while read -r r; do
+        if [[ $r == "$any" || $r == "$any "* ]]; then
+            echo "full tunnel: static route '$r'"
+            return
+        fi
+    done < <(nm_list "$con" "$p.routes")
+    # Taking over a table the user chose could strand other profiles using it.
+    table=$(nm_get "$con" "$p.route-table")
+    if [[ $table != 0 ]] && ! in_range "$table"; then
+        echo "$p.route-table is already $table, which is not ours"
+    fi
+}
+
+# Tables in use by any other profile or present in the kernel. -N prints table
+# numbers even where rt_tables.d names them.
+used_tables() {
+    local uuid
+    while read -r uuid; do
+        [[ $uuid == "$1" ]] && continue
+        LC_ALL=C nmcli -g ipv4.route-table,ipv6.route-table connection show "$uuid" 2>/dev/null || true
+    done < <(LC_ALL=C nmcli -g UUID connection show)
+    { ip -N -4 rule show; ip -N -6 rule show; } 2>/dev/null \
+        | grep -oE 'lookup [0-9]+' | cut -d' ' -f2 || true
+    { ip -N -4 route show table all; ip -N -6 route show table all; } 2>/dev/null \
+        | grep -oE 'table [0-9]+' | cut -d' ' -f2 || true
+}
+
+# Reuse the profile's reserved table if it has one; otherwise the lowest free.
+pick_table() {
+    local con=$1 uuid=$2 fam t used
+    for fam in 4 6; do
+        t=$(nm_get "$con" "ipv$fam.route-table")
+        if in_range "$t"; then
+            echo "$t"
+            return
+        fi
+    done
+    used=$(used_tables "$uuid" | sort -un)
+    for (( t = TABLE_MIN; t <= TABLE_MAX; t++ )); do
+        if ! grep -qx "$t" <<< "$used"; then
+            echo "$t"
+            return
+        fi
+    done
+    fail "every reserved routing table ($TABLE_MIN-$TABLE_MAX) is in use"
+}
+
+# Append nmcli modify arguments to ARGS for one family. Our rules are always
+# stripped first, so re-running after an address change replaces stale rules
+# instead of stacking them; with a table, they are then re-added for the
+# current addresses.
+family_args() {
+    local con=$1 fam=$2 t=$3 p r a removed=0 table
+    local -a rules=()
+    p=ipv$fam
+
+    while read -r r; do
+        [[ -n $r ]] || continue
+        if rule_is_ours "$r"; then
+            removed=1
+        else
+            rules+=("$r")
+        fi
+    done < <(nm_list "$con" "$p.routing-rules")
+
+    if [[ -n $t ]]; then
+        while read -r a; do
+            [[ -n $a ]] || continue
+            rules+=("priority $PRIO_SRC from ${a%/*} table $t")
+            rules+=("priority $PRIO_BLOCK from ${a%/*} type unreachable")
+        done < <(nm_list "$con" "$p.addresses")
+        rules+=("priority $PRIO_DST from $(family_any "$fam") table $t")
+        ARGS+=("$p.route-table" "$t")
+    else
+        table=$(nm_get "$con" "$p.route-table")
+        if in_range "$table"; then
+            ARGS+=("$p.route-table" 0)
+            removed=1
+        fi
+        # Nothing of ours here: leave the family untouched, which also avoids
+        # writing rules into a family whose method is 'disabled'.
+        (( removed )) || return 0
+    fi
+    ARGS+=("$p.routing-rules" "$(join_list "${rules[@]}")")
+}
+
+# Push the saved profile to the live device, if it is connected.
+reapply() {
+    local con=$1 dev
+    dev=$(nm_get "$con" GENERAL.DEVICES)
+    if [[ -z $dev ]]; then
+        echo 'Connection is not active; this takes effect when it next connects.'
+    elif LC_ALL=C nmcli device reapply "$dev" >/dev/null; then
+        echo "Reapplied to $dev."
+    else
+        echo "Could not reapply to $dev live. Reconnect: nmcli connection up '$con'" >&2
+        return 1
+    fi
+}
+
+resolve() {
+    local con=$1 uuid type
+    uuid=$(nm_get "$con" connection.uuid 2>/dev/null) \
+        || fail "no NetworkManager connection '$con'"
+    type=$(nm_get "$uuid" connection.type)
+    [[ $type == wireguard ]] || fail "'$con' is a $type connection; only WireGuard is supported"
+    echo "$uuid"
+}
+
+cmd_apply() {
+    local con=$1 uuid fam reason label t=''
+    local -a confine=() skipped=()
+    uuid=$(resolve "$con") || exit 1
+
+    for fam in 4 6; do
+        reason=$(unconfinable_reason "$uuid" "$fam")
+        if [[ -z $reason ]]; then
+            confine+=("$fam")
+        else
+            skipped+=("IPv$fam: $reason")
+        fi
+    done
+    if (( ${#confine[@]} )); then
+        t=$(pick_table "$uuid" "$uuid") || exit 1
+    fi
+
+    ARGS=()
+    for fam in 4 6; do
+        if [[ " ${confine[*]} " == *" $fam "* ]]; then
+            family_args "$uuid" "$fam" "$t"
+        else
+            family_args "$uuid" "$fam" ''
+        fi
+    done
+    if (( ${#ARGS[@]} )); then
+        LC_ALL=C nmcli connection modify "$uuid" "${ARGS[@]}"
+    fi
+
+    for reason in "${skipped[@]}"; do
+        echo "Skipped $reason"
+    done
+    if (( ${#confine[@]} == 0 )); then
+        fail "nothing to confine in '$con'"
+    fi
+    label=$(printf 'IPv%s + ' "${confine[@]}")
+    printf 'Confined %s of %s to routing table %s.\n' \
+        "${label% + }" "$(nm_get "$uuid" connection.id)" "$t"
+    reapply "$uuid"
+}
+
+cmd_remove() {
+    local con=$1 uuid
+    uuid=$(resolve "$con") || exit 1
+    ARGS=()
+    family_args "$uuid" 4 ''
+    family_args "$uuid" 6 ''
+    if (( ${#ARGS[@]} == 0 )); then
+        echo "'$con' is not confined; nothing to remove."
+        return
+    fi
+    LC_ALL=C nmcli connection modify "$uuid" "${ARGS[@]}"
+    echo "Removed confinement from $(nm_get "$uuid" connection.id)."
+    reapply "$uuid"
+}
+
+# Returns 1 if anything needs attention.
+status_one() {
+    local con=$1 rc=0 name dev fam p t a a_re r reason ours probe live
+    local -a addrs
+    name=$(nm_get "$con" connection.id)
+    dev=$(nm_get "$con" GENERAL.DEVICES)
+    printf '%s%s\n' "$name" "${dev:+ (active on $dev)}"
+
+    for fam in 4 6; do
+        p=ipv$fam
+        t=$(nm_get "$con" "$p.route-table")
+        ours=''
+        while read -r r; do
+            [[ -n $r ]] && rule_is_ours "$r" && ours+="$r"$'\n'
+        done < <(nm_list "$con" "$p.routing-rules")
+
+        if [[ -z $ours ]]; then
+            reason=$(unconfinable_reason "$con" "$fam")
+            if [[ -n $reason ]]; then
+                state "IPv$fam" "n/a -- $reason"
+            else
+                state "IPv$fam" "NOT CONFINED -- ujust wg-confine '$name'"
+                rc=1
+            fi
+            continue
+        fi
+
+        mapfile -t addrs < <(nm_list "$con" "$p.addresses")
+        # An address edited after confining keeps rules for the old address
+        # and has none of its own.
+        for a in "${addrs[@]}"; do
+            a=${a%/*}
+            if ! grep -qF "priority $PRIO_SRC from $a table $t" <<< "$ours" \
+                || ! grep -qF "priority $PRIO_BLOCK from $a type unreachable" <<< "$ours"; then
+                state "IPv$fam" "STALE, $a has no rules -- ujust wg-confine '$name'"
+                rc=1
+                continue 2
+            fi
+        done
+        state "IPv$fam" "confined, table $t"
+
+        [[ -n $dev ]] || continue
+        probe=$(family_probe "$fam")
+        # -N keeps table numbers comparable with $t, but it also prints the
+        # unreachable action as its numeric route type, 7.
+        live=$(ip -N "-$fam" rule show)
+        for a in "${addrs[@]}"; do
+            a=${a%/*}
+            a_re=${a//./\\.}
+            if ! grep -qE "^$PRIO_SRC:[[:space:]]+from $a_re lookup $t( |\$)" <<< "$live" \
+                || ! grep -qE "^$PRIO_BLOCK:[[:space:]]+from $a_re (unreachable|7)( |\$)" <<< "$live"; then
+                state "  $a" 'profile confined but kernel rules MISSING -- reconnect'
+                rc=1
+            elif ip "-$fam" route get "$probe" from "$a" >/dev/null 2>&1; then
+                state "  $a" "LEAKS: $probe is routable from it"
+                rc=1
+            else
+                state "  $a" "live, $probe unreachable from it"
+            fi
+        done
+    done
+    return "$rc"
+}
+
+cmd_status() {
+    local rc=0 con
+    local -a cons=("$@")
+    if (( ${#cons[@]} == 0 )); then
+        mapfile -t cons < <(LC_ALL=C nmcli -g UUID,TYPE connection show \
+            | awk -F: '$2 == "wireguard" { print $1 }')
+        (( ${#cons[@]} )) || { echo 'No WireGuard connections.'; return 0; }
+    else
+        for con in "${cons[@]}"; do
+            resolve "$con" >/dev/null || exit 1
+        done
+    fi
+    for con in "${cons[@]}"; do
+        status_one "$con" || rc=1
+    done
+    return "$rc"
+}
+
+case ${1:-} in
+    apply)  [[ $# -eq 2 ]] || usage; cmd_apply "$2" ;;
+    remove) [[ $# -eq 2 ]] || usage; cmd_remove "$2" ;;
+    status) shift; cmd_status "$@" ;;
+    *) usage ;;
+esac
