@@ -299,12 +299,35 @@ matlab-agentic-toolkit:
 
     chmod +x "${HOME}/.matlab/agentic-toolkits/bin/matlab-mcp-server" 2>/dev/null || true
 
-    cat <<'NOTE'
+    # The Simulink tools only resolve after satk_initialize, once per session.
+    # Kept between markers so a re-run replaces the block, not appends to it.
+    startup="${HOME}/Documents/MATLAB/startup.m"
+    begin='% >>> fromelicks: Simulink Agentic Toolkit >>>'
+    end='% <<< fromelicks: Simulink Agentic Toolkit <<<'
+    mkdir -p "$(dirname "${startup}")"
+    touch "${startup}"
+    kept="$(awk -v b="${begin}" -v e="${end}" '$0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }' "${startup}")"
+    {
+        [[ -n "${kept}" ]] && printf '%s\n' "${kept}"
+        printf '%s\n' "${begin}"
+        cat <<MFILE
+    satkDir = fullfile(getenv('HOME'), '.matlab', 'agentic-toolkits', 'simulink');
+    if contains(version, '${MATLAB_RELEASE}') && ~batchStartupOptionUsed && isfolder(satkDir)
+        addpath(satkDir)
+        satk_initialize
+    end
+    clear satkDir
+    MFILE
+        printf '%s\n' "${end}"
+    } > "${startup}.tmp"
+    mv -f "${startup}.tmp" "${startup}"
 
-    Installed. To use it, start MATLAB and share its session:
+    cat <<NOTE
 
-        ujust matlab                 # in one terminal
-        >> satk_initialize           # in the MATLAB command window
+    Installed. ${startup} now runs satk_initialize
+    whenever MATLAB starts; restart MATLAB if it is already running:
+
+        ujust matlab
 
     Then restart Claude Code so it picks up the new MCP server and skills.
     See docs/matlab-distrobox.md if the server cannot reach MATLAB.

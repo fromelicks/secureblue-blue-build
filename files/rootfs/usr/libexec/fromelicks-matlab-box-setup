@@ -74,6 +74,18 @@ WRAPPER
     chmod 0755 "/usr/local/bin/${tool}"
 done
 
+# nvidia=true bind-mounts the host's nvidia-modprobe, a Fedora build that
+# RHEL 9's glibc cannot load. The CUDA libraries call it on every start and
+# print a glibc error each time. It could not load modules from a rootless
+# container anyway, and the host has already created the device nodes, so
+# cover it with a no-op. distrobox mounts the NVIDIA files before the hooks run.
+for modprobe in /usr/bin/nvidia-modprobe /usr/sbin/nvidia-modprobe; do
+    if [[ -f "${modprobe}" ]] && ! cmp -s /usr/bin/true "${modprobe}"; then
+        mount --bind /usr/bin/true "${modprobe}" ||
+            log "could not cover ${modprobe}; CUDA will print glibc errors"
+    fi
+done
+
 # setupAgenticToolkit() registers its skills by shelling out to `claude`, which
 # lives on the host. Without this it falls back to symlinks in ~/.claude/skills
 # and the plugin system never learns about the skill packages.

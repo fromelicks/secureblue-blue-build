@@ -337,20 +337,30 @@ namespace. Session discovery reads a record under `$HOME`, and MATLAB's
 connector listens on the host's own loopback (`127.0.0.1:31515`/`31516`), so
 `--matlab-session-mode=existing` finds and attaches to it.
 
-MATLAB has to be running and sharing its session:
+MATLAB has to be running with `satk_initialize` run in that session. It puts
+the Simulink tools on the path and calls `shareMATLABSession()`. Without it the
+MATLAB tools still work, but every `model_*` tool fails with
+`Unrecognized function or variable`. `satk_initialize` is not on the path by
+itself, so the full step is:
 
-```
-ujust matlab            # one terminal
->> satk_initialize      # in the MATLAB command window; calls shareMATLABSession()
+```matlab
+addpath("~/.matlab/agentic-toolkits/simulink")
+satk_initialize
 ```
 
-Then restart Claude Code so it picks up the server and skills.
+`ujust matlab-agentic-toolkit` writes this into `~/Documents/MATLAB/startup.m`
+between `% >>> fromelicks: Simulink Agentic Toolkit` markers, so it runs on
+every start. It is skipped for `-batch` sessions and when the toolkit folder is
+gone. Restart Claude Code after the first install so it picks up the server and
+skills.
 
 Two failure modes that look alike and are not:
 
 - **`failed to attach to MATLAB session` / `session is not alive`** — the
   session record under `$HOME` is stale, pointing at the port of a MATLAB that
   has exited. Re-run `satk_initialize` in a live session.
+- **`Unrecognized function or variable 'model_edit'`** (or any `model_*`) —
+  `satk_initialize` has not run in this session; see above.
 - **The call hangs with no response at all** — MATLAB is alive but its
   interpreter is *busy*. A session parked in `pause()` cannot service
   requests; it has to be idle at the prompt.
@@ -373,6 +383,13 @@ progress lines that would corrupt the MCP stdio stream.
   host driver directories to `ld.so.conf`, which can shadow container
   libraries and break OpenGL. If graphics misbehave, set it to false first;
   `FROMELICKS_MATLAB_SOFTWARE_OPENGL=1 ujust matlab` is the other escape hatch.
+- **`nvidia-modprobe: ... GLIBC_ABI_DT_RELR' not found`.** `nvidia=true` also
+  bind-mounts the host's `nvidia-modprobe`, built against Fedora's glibc, which
+  RHEL 9's glibc 2.34 cannot load. The CUDA libraries call it at start-up, for
+  example when Simulink opens. It is harmless: the host has already created
+  `/dev/nvidia*`, and a rootless container could not load modules anyway. The
+  init hook bind-mounts `/usr/bin/true` over it. If GPU code fails in the box,
+  run `nvidia-smi` on the host to recreate a missing `/dev/nvidia-uvm`.
 - **ptrace.** secureblue's `set-selinux-booleans.sh` sets `deny_ptrace=on` and
   `container_allow_ptrace=off`. Ordinary work is unaffected, but attaching
   `gdb` to a mex file needs both flipped. `ujust toggle-debug-mode` handles the
