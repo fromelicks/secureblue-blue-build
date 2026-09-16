@@ -5,53 +5,42 @@
 #
 # usage: fromelicks-matlab-launch [matlab args...]     (default: -desktop)
 #
-# The split matters. xwayland-satellite has to run on the HOST, because it is a
-# Wayland client of the host compositor; MATLAB has to run in the CONTAINER,
-# because Fedora is not a MathWorks-supported platform. They meet over the X
-# socket in /tmp, which distrobox bind-mounts into the box as /tmp:rslave --
-# so the container needs no display plumbing of its own and no manifest entry.
+# xwayland-satellite has to run on the host (it is a client of the host
+# compositor), MATLAB in the container (Fedora is not MathWorks-supported).
+# They meet over the X socket in /tmp, which distrobox shares.
 #
-# This is deliberately NOT a distrobox-exported application. distrobox-export
-# writes a desktop entry that runs `distrobox enter` directly, which would
-# start MATLAB with no X server at all under GNOME's default --no-x11. Going
-# through a launcher is what lets the display be set up first.
+# Not a distrobox-exported app: an exported entry would run `distrobox enter`
+# with no X server at all under GNOME's default --no-x11.
 #
 # See docs/matlab-distrobox.md.
 
 set -euo pipefail
 
 readonly PROG="${0##*/}"
-readonly RELEASE='R2026a'
-readonly BOX='matlab'
-readonly XRUN='/usr/libexec/fromelicks-xwayland-isolated'
-readonly INSTALL_DIR="${HOME}/.local/share/matlab-distrobox"
+LIBEXEC="$(dirname "$(readlink -f "$0")")"
+readonly LIBEXEC
+readonly XRUN="${LIBEXEC}/fromelicks-xwayland-isolated"
+
+# shellcheck source=fromelicks-matlab-env
+source "${LIBEXEC}/fromelicks-matlab-env"
 
 fail() { printf '%s: %s\n' "${PROG}" "$*" >&2; exit 1; }
 
 [[ -x "${XRUN}" ]] || fail "${XRUN} is missing"
 
-[[ -x "${INSTALL_DIR}/${RELEASE}/bin/matlab" ]] ||
-    fail "MATLAB ${RELEASE} is not installed in ${INSTALL_DIR}. Run 'ujust matlab-install'."
-
-# Anchored on the NAME column: `grep -qw matlab` would also match a container
-# called matlab-dev, since '-' is a word boundary.
-distrobox list 2>/dev/null |
-    awk -F'|' -v box="${BOX}" 'NR>1 && $2 ~ "^ *" box " *$" { f=1 } END { exit !f }' ||
-    fail "the '${BOX}' container does not exist. Run 'ujust matlab-box'."
+matlab_installed ||
+    fail "MATLAB ${MATLAB_RELEASE} is not installed in ${MATLAB_INSTALL_DIR}. Run 'ujust matlab-install'."
+matlab_box_exists ||
+    fail "the '${MATLAB_BOX}' container does not exist. Run 'ujust matlab-box'."
 
 (( $# )) || set -- -desktop
 
-# MATLAB's figure rendering goes through the container's Mesa. That is the
-# right default -- it is hardware accelerated through the isolated Xwayland --
-# but distrobox prepends the host NVIDIA driver directories to ld.so.conf when
-# the manifest sets nvidia=true, which can shadow the container's libGL. This
-# is the escape hatch for that, and for any other OpenGL misbehaviour.
+# Escape hatch for OpenGL trouble, e.g. host NVIDIA libraries shadowing the
+# container's libGL when the manifest sets nvidia=true.
 if [[ "${FROMELICKS_MATLAB_SOFTWARE_OPENGL:-0}" == '1' ]]; then
     set -- -softwareopengl "$@"
 fi
 
-# LD_PRELOAD is dropped inside the container by the /usr/local/bin wrappers
-# rather than here, because `distrobox enter` re-exports the host environment
-# into the container after this process is gone. See the wrapper block in
-# fromelicks-matlab-box-setup.
-exec "${XRUN}" distrobox enter --name "${BOX}" -- /usr/local/bin/matlab "$@"
+# LD_PRELOAD and SHELL are fixed inside the container by the /usr/local/bin
+# wrapper, since `distrobox enter` re-exports the host environment.
+exec "${XRUN}" distrobox enter --name "${MATLAB_BOX}" -- /usr/local/bin/matlab "$@"

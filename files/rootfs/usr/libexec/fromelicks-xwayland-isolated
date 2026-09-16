@@ -52,7 +52,10 @@ command -v xwayland-satellite >/dev/null ||
     fail 'no WAYLAND_DISPLAY; this needs to run inside a Wayland session'
 
 # Check-then-bind cannot be made atomic, so let the bind lose the race and
-# move on rather than computing a number up front.
+# move on rather than computing a number up front. Only an *exit* means the
+# number was taken; a server that stays up but never becomes ready is a real
+# failure, and trying 31 more numbers would just repeat it.
+last_log=''
 for (( n = DISPLAY_MIN; n <= DISPLAY_MAX; n++ )); do
     [[ -e "/tmp/.X11-unix/X${n}" ]] && continue
 
@@ -60,29 +63,45 @@ for (( n = DISPLAY_MIN; n <= DISPLAY_MAX; n++ )); do
     xwayland-satellite ":${n}" >"${log_file}" 2>&1 &
     satellite_pid=$!
 
-    ready=0
+    state='timeout'
     for (( i = 0; i < READY_TIMEOUT * 10; i++ )); do
         # The socket appears before xwayland-satellite will serve clients, so
         # wait for its readiness line instead.
         if grep -q "Connected to Xwayland on :${n}" "${log_file}" 2>/dev/null; then
-            ready=1
+            state='ready'
             break
         fi
-        kill -0 "${satellite_pid}" 2>/dev/null || break
+        if ! kill -0 "${satellite_pid}" 2>/dev/null; then
+            state='exited'
+            break
+        fi
         sleep 0.1
     done
 
-    (( ready )) && break
-
-    kill "${satellite_pid}" 2>/dev/null || true
-    wait "${satellite_pid}" 2>/dev/null || true
-    satellite_pid=''
-    rm -f "${log_file}"
-    log_file=''
+    case "${state}" in
+        ready)
+            break
+            ;;
+        timeout)
+            log "xwayland-satellite :${n} did not become ready within ${READY_TIMEOUT}s; its output:"
+            cat "${log_file}" >&2
+            exit 1
+            ;;
+        exited)
+            wait "${satellite_pid}" 2>/dev/null || true
+            satellite_pid=''
+            last_log="$(cat "${log_file}")"
+            rm -f "${log_file}"
+            log_file=''
+            ;;
+    esac
 done
 
-[[ -n "${satellite_pid}" ]] ||
-    fail "no display number free between :${DISPLAY_MIN} and :${DISPLAY_MAX}"
+if [[ -z "${satellite_pid}" ]]; then
+    log "xwayland-satellite exited on every display from :${DISPLAY_MIN} to :${DISPLAY_MAX}; last output:"
+    printf '%s\n' "${last_log}" >&2
+    exit 1
+fi
 
 export DISPLAY=":${n}"
 

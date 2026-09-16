@@ -13,12 +13,14 @@
 
 set -euo pipefail
 
-readonly RELEASE='R2026a'
-readonly RELEASE_LC='r2026a'
-readonly DEST="/opt/matlab/${RELEASE}"
-readonly DEPS_STAMP="/var/lib/fromelicks-matlab-deps-${RELEASE}"
+# Invoked as /run/host/usr/libexec/..., so the env file sits beside it.
+# shellcheck source=fromelicks-matlab-env
+source "$(dirname "$0")/fromelicks-matlab-env"
+
+readonly DEST="${MATLAB_CONTAINER_ROOT}"
+readonly DEPS_STAMP="/var/lib/fromelicks-matlab-deps-${MATLAB_RELEASE}"
 readonly LOG='/opt/matlab/setup.log'
-readonly DEPS_URL="https://raw.githubusercontent.com/mathworks-ref-arch/container-images/main/matlab-deps/${RELEASE_LC}/ubi9/base-dependencies.txt"
+readonly DEPS_URL="https://raw.githubusercontent.com/mathworks-ref-arch/container-images/main/matlab-deps/${MATLAB_RELEASE,,}/ubi9/base-dependencies.txt"
 
 log() { printf 'distrobox: matlab-box: %s\n' "$*"; }
 fail() { printf 'Error: matlab-box: %s (see %s)\n' "$*" "${LOG}" >&2; exit 1; }
@@ -44,10 +46,9 @@ if [[ ! -f "${DEPS_STAMP}" ]]; then
     (( ${#deps[@]} )) || fail 'the dependency list came back empty'
 
     log "installing ${#deps[@]} dependency packages"
-    # --disableplugin=subscription-manager: UBI outside a subscribed RHEL host
-    # has no entitlement, and the plugin errors out rather than falling back to
-    # the UBI repos, which carry everything on the list.
-    dnf install -y --disableplugin=subscription-manager "${deps[@]}" >> "${LOG}" 2>&1 \
+    # Plain dnf, like distrobox's own additional_packages step: the UBI repos
+    # carry everything on the list and need no subscription.
+    dnf install -y "${deps[@]}" >> "${LOG}" 2>&1 \
         || fail 'the dependency install failed'
 
     mkdir -p "$(dirname "${DEPS_STAMP}")"
@@ -67,11 +68,9 @@ fi
 # dies the instant it spawns, leaving a parent spinning at 40% CPU with no
 # window and no error.
 #
-# SHELL is reset for a separate reason. distrobox exports SHELL=bash -- a bare
-# name, not a path -- and MATLAB execs $SHELL directly for every system() call,
-# so an unqualified name fails with 127 and no output. That silently breaks
-# system(), !, mex, make and every Simulink Coder build, and it presents as
-# "command not found" for commands that plainly exist.
+# SHELL: distrobox sets a bare `bash`, which MATLAB cannot exec for system().
+# The manifest overrides it container-wide; repeating it here covers boxes
+# assembled from an older manifest.
 for tool in matlab mex mbuild; do
     cat > "/usr/local/bin/${tool}" <<WRAPPER
 #!/usr/bin/env bash

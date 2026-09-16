@@ -12,12 +12,25 @@ invocation — secureblue's global `set-xwayland` stays **off**.
 | `/usr/libexec/fromelicks-matlab-box-setup` | init hook: MathWorks dependencies + entry points |
 | `/usr/libexec/fromelicks-xwayland-isolated` | runs any command against a private X server |
 | `/usr/libexec/fromelicks-matlab-launch` | ties the two together |
+| `/usr/libexec/fromelicks-matlab-env` | shared constants (release, paths, box name) and checks, sourced by all of the above |
 | `ujust matlab-install / matlab-box / matlab / check-matlab / matlab-agentic-toolkit / remove-matlab-box / matlab-uninstall` | drives all of it |
 
 `matlab.ini` is a template. `ujust matlab-box` copies it to
 `~/.config/distrobox/` and works from the copy, because the license server
 address is per-machine. Editing it in `/etc` would permanently dirty
 `ostree admin config-diff`.
+
+The template carries a `# fromelicks-matlab-manifest: N` revision. When the
+per-machine copy has a lower one — or none, as every copy seeded before the
+move to UBI9 does — `matlab-box` moves it aside as `matlab.ini.revN.bak`,
+re-seeds from the template, and carries the `MLM_LICENSE_FILE` line across.
+Without this, a copy of the old Ubuntu manifest would keep pointing at an
+image that no longer pulls. Bump the revision whenever a template change has
+to reach existing machines; `check-matlab` reports an outdated copy.
+
+`ujust` runs every recipe from `/usr/share/ublue-os`, not from the caller's
+directory. `matlab-install` resolves a relative ISO path, and `ujust matlab`
+starts MATLAB, against `invocation_directory()` instead.
 
 ## The display: a private Xwayland, not the global toggle
 
@@ -63,7 +76,10 @@ security reduction that is not needed.
 `fromelicks-xwayland-isolated` picks a free display in `:32`–`:63`, waits for
 xwayland-satellite's own readiness line rather than for the socket (the socket
 appears first, before it will serve clients), and tears the server down on
-exit including on signal.
+exit including on signal. Only an *exit* of xwayland-satellite counts as
+"number taken, try the next". A server that stays up but never becomes ready
+fails straight away and prints its own log. Retrying 31 more numbers would
+just repeat the failure for eight minutes and then blame the wrong cause.
 
 The X socket lives in `/tmp/.X11-unix`, which distrobox already bind-mounts
 into the container as `/tmp:rslave` — so the host runs the X server, the
@@ -134,8 +150,13 @@ and every Simulink Coder build, and it presents as "command not found" for
 commands that plainly exist. It is what made the agentic toolkit register
 0 of 183 skills.
 
-The `/usr/local/bin/{matlab,mex,mbuild}` wrappers therefore
-`export SHELL=/bin/bash` alongside unsetting `LD_PRELOAD`.
+The value comes from `distrobox-create`, which bakes
+`--env SHELL=$(basename "$SHELL")` into the container. The manifest's
+`additional_flags` are appended after it and podman keeps the last `--env`, so
+the manifest sets `SHELL=/bin/bash` for the whole container. That covers every
+way in: the wrappers, `/opt/matlab/R2026a/bin/matlab` run directly, and the
+`podman exec` MCP fallback. The `/usr/local/bin` wrappers export it as well,
+for boxes assembled from an older manifest.
 
 ## Installing: the ISO, not mpm
 
@@ -146,7 +167,15 @@ are Windows-only and rejected by name).
 
 `ujust matlab-install` loop-mounts it with `udisksctl` — unprivileged, via
 polkit, landing under `/run/media/$USER` — and runs MathWorks' own GUI
-installer against it.
+installer against it. With no argument it takes the newest `*_Linux.iso` under
+`~/Downloads`.
+
+It reuses a loop device already attached to the file, mounted or not, instead
+of stacking a second one. It tolerates a desktop automounting the device
+first, and it unmounts and detaches the ISO on exit. `udisksctl loop-delete`
+on a still-mounted device only arms autoclear and still returns 0, so the
+recipe checks `losetup -j` afterwards and prints the release commands if the
+device is still attached.
 
 Leave every product selected. The installer offers exactly what the license
 covers, which is what "the full suite" means in practice; on this machine that
@@ -214,9 +243,9 @@ Ubuntu 26.04, no Fedora.
   dependency packages plus `gcc`/`gcc-c++`/`gcc-gfortran`/`make` all come from
   the default UBI repos with no EPEL. **No policy change needed.**
 
-`dnf` is invoked with `--disableplugin=subscription-manager`: outside a
-subscribed RHEL host the plugin errors out instead of falling back to the UBI
-repos, which carry everything on the list.
+Plain `dnf install` works. The image ships the subscription-manager dnf
+plugin, but on an unsubscribed host it only complains; it does not block the
+UBI repos. distrobox's own `additional_packages` step uses plain `dnf` too.
 
 ## The network license
 
@@ -264,6 +293,13 @@ truth off a running window with `xprop WM_CLASS` and correct it in the recipe.
 runs MathWorks' `setupAgenticToolkit` inside the container's MATLAB with
 `Offline=true` so nothing is downloaded from inside the box, where a failure
 would surface as a MATLAB exception rather than a curl error.
+
+The three release artifacts are downloaded again on every run, because their
+URLs track `releases/latest` and the toolkit repositories are pulled on every
+run too; refreshing only one side lets the versions drift apart. Each file is
+written to a temp file and moved into place only after a complete download,
+so a dropped transfer never replaces a good copy. If a download fails but a
+cached copy exists, the recipe warns and uses the cached copy.
 
 It installs both the MATLAB and Simulink toolkits, registers the MCP server in
 `~/.claude.json`, and installs the nine Simulink skill packages globally
@@ -335,9 +371,11 @@ progress lines that would corrupt the MCP stdio stream.
   `container_allow_ptrace=off`. Ordinary work is unaffected, but attaching
   `gdb` to a mex file needs both flipped. `ujust toggle-debug-mode` handles the
   first; the second has no ujust recipe and needs `setsebool` by hand.
-- **Multi-line `-batch`.** `distrobox enter -- matlab -batch "<multi-line>"`
-  loses the argument (`No MATLAB command specified`). Put the code in a `.m`
-  file and use `-batch "run('/path/to/file.m')"`.
+- **Multi-line `-batch`.** MATLAB's own launcher (`build_cmd` in `bin/matlab`)
+  quotes each line of a `-batch` argument separately, so only the first line
+  arrives — and if the string starts with a newline, that is an empty command
+  (`No MATLAB command specified`). Put the code in a `.m` file and use
+  `-batch "run('/path/to/file.m')"`, as `matlab-agentic-toolkit` does.
 - **Hyphens in script names.** `run('.../satk-install.m')` fails with
   `Unrecognized function or variable 'satk'` — `run` evaluates the file *stem*,
   and `satk-install` parses as a subtraction. Use underscores.

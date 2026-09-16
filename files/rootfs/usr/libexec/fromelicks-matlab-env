@@ -1,0 +1,24 @@
+# Shared constants and helpers for the MATLAB setup. Sourced, not executed, by
+# the ujust recipes, fromelicks-matlab-launch and (inside the container, via
+# /run/host) fromelicks-matlab-box-setup. Bump the release here only.
+# shellcheck shell=bash disable=SC2034  # consumed by the sourcing scripts
+
+readonly MATLAB_RELEASE='R2026a'
+readonly MATLAB_BOX='matlab'
+# Host-side install root; the container sees the same directory at /opt/matlab.
+readonly MATLAB_INSTALL_DIR="${HOME:-}/.local/share/matlab-distrobox"
+readonly MATLAB_CONTAINER_ROOT="/opt/matlab/${MATLAB_RELEASE}"
+readonly MATLAB_MANIFEST="${HOME:-}/.config/distrobox/matlab.ini"
+readonly MATLAB_MANIFEST_TEMPLATE='/etc/distrobox/matlab.ini'
+
+matlab_installed() { [[ -x "${MATLAB_INSTALL_DIR}/${MATLAB_RELEASE}/bin/matlab" ]]; }
+
+# Anchored on the NAME column: `grep -qw matlab` would also match a container
+# called matlab-dev, since '-' is a word boundary.
+matlab_box_exists() {
+    distrobox list 2>/dev/null |
+        awk -F'|' -v box="${MATLAB_BOX}" 'NR>1 && $2 ~ "^ *" box " *$" { f=1 } END { exit !f }'
+}
+
+# Revision marker of a manifest, from its `# fromelicks-matlab-manifest: N` line.
+matlab_manifest_revision() { sed -n 's/^# fromelicks-matlab-manifest: *//p' "$1" 2>/dev/null | head -1; }
