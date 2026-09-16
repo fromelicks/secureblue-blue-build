@@ -1,7 +1,7 @@
 # MATLAB R2026a + Simulink
 
-MATLAB is installed once from the release ISO onto a host directory, and run
-from a RHEL 9 distrobox. The display is a private Xwayland started per
+MATLAB is installed by hand onto a host directory, and run from a RHEL 9
+distrobox. The display is a private Xwayland started per
 invocation — secureblue's global `set-xwayland` stays **off**.
 
 ## What is in the image
@@ -11,9 +11,13 @@ invocation — secureblue's global `set-xwayland` stays **off**.
 | `/etc/distrobox/matlab.ini` | assemble manifest **template** |
 | `/usr/libexec/fromelicks-matlab-box-setup` | init hook: MathWorks dependencies + entry points |
 | `/usr/libexec/fromelicks-xwayland-isolated` | runs any command against a private X server |
-| `/usr/libexec/fromelicks-matlab-launch` | ties the two together |
-| `/usr/libexec/fromelicks-matlab-env` | shared constants (release, paths, box name) and checks, sourced by all of the above |
-| `ujust matlab-install / matlab-box / matlab / check-matlab / matlab-agentic-toolkit / remove-matlab-box / matlab-uninstall` | drives all of it |
+| `ujust matlab-box / matlab / check-matlab / matlab-agentic-toolkit / remove-matlab-box / matlab-uninstall` | everything else |
+
+The init hook is the one piece that cannot be a recipe: it runs inside the
+container, and the host's `just` needs glibc 2.39 where RHEL 9 has 2.34. It
+takes the release as its argument, which must match `matlab_release` in
+`matlab.just`. `fromelicks-xwayland-isolated` stays a script because it is not
+MATLAB-specific.
 
 `matlab.ini` is a template. `ujust matlab-box` copies it to
 `~/.config/distrobox/` and works from the copy, because the license server
@@ -29,8 +33,29 @@ image that no longer pulls. Bump the revision whenever a template change has
 to reach existing machines; `check-matlab` reports an outdated copy.
 
 `ujust` runs every recipe from `/usr/share/ublue-os`, not from the caller's
-directory. `matlab-install` resolves a relative ISO path, and `ujust matlab`
-starts MATLAB, against `invocation_directory()` instead.
+directory, so `ujust matlab` starts MATLAB in `invocation_directory()`.
+
+## Installing MATLAB
+
+Not automated. With the release ISO downloaded:
+
+1. Mount it — open it in Files, or
+   `udisksctl loop-setup -r -f R2026a_Update_4_Linux.iso`, which GNOME
+   automounts under `/run/media/$USER/`.
+2. Run MathWorks' installer on a private X display, **without**
+   hardened_malloc (see below):
+
+   ```
+   env -u LD_PRELOAD /usr/libexec/fromelicks-xwayland-isolated /run/media/$USER/<label>/install
+   ```
+
+3. Set the destination folder to
+   **`~/.local/share/matlab-distrobox/R2026a`** — the path `ujust matlab` and
+   the container expect. Leave every product selected; the installer offers
+   exactly what the license covers.
+4. Unmount the ISO, then `ujust matlab-box`.
+
+The full suite came to 114 products and ~25 GB here.
 
 ## The display: a private Xwayland, not the global toggle
 
@@ -123,7 +148,7 @@ GUI installer on this machine produced exactly the zombie above.
 
 Two places drop it:
 
-- `ujust matlab-install` runs the installer under `env -u LD_PRELOAD`.
+- The installer has to be run under `env -u LD_PRELOAD`, as above.
 - The container's `/usr/local/bin/{matlab,mex,mbuild}` are wrapper scripts that
   `unset LD_PRELOAD` before exec, **not** symlinks. `distrobox enter` forwards
   nearly the whole host environment into the container — its blocklist covers
@@ -158,30 +183,12 @@ way in: the wrappers, `/opt/matlab/R2026a/bin/matlab` run directly, and the
 `podman exec` MCP fallback. The `/usr/local/bin` wrappers export it as well,
 for boxes assembled from an older manifest.
 
-## Installing: the ISO, not mpm
+## mpm cannot install from the ISO
 
 The release ISO (`R2026a_Update_4_Linux.iso`, 14 GB) contains the complete
 release: 127 products listed in `installer_input.txt`, 125 of which are
 installable on `glnxa64` (`Spreadsheet_Link` and `STM32_Microcontroller_Blockset`
 are Windows-only and rejected by name).
-
-`ujust matlab-install` loop-mounts it with `udisksctl` — unprivileged, via
-polkit, landing under `/run/media/$USER` — and runs MathWorks' own GUI
-installer against it. With no argument it takes the newest `*_Linux.iso` under
-`~/Downloads`.
-
-It reuses a loop device already attached to the file, mounted or not, instead
-of stacking a second one. It tolerates a desktop automounting the device
-first, and it unmounts and detaches the ISO on exit. `udisksctl loop-delete`
-on a still-mounted device only arms autoclear and still returns 0, so the
-recipe checks `losetup -j` afterwards and prints the release commands if the
-device is still attached.
-
-Leave every product selected. The installer offers exactly what the license
-covers, which is what "the full suite" means in practice; on this machine that
-produced **114 products**.
-
-### mpm cannot install from this ISO
 
 `mpm install --source=<mounted ISO>` looks like the obvious automated path. It
 reads the ISO's catalogue correctly — it validates product names against it and
@@ -269,7 +276,7 @@ container. Roughly 25 GB for 114 products. Keeping it on a host volume means
 `distrobox rm`, `--replace` or a botched assemble costs the 30 seconds it takes
 to reinstall the container's dependencies, not a reinstall of MATLAB.
 
-Because the ISO installer runs as the host user, the tree is owned by that user
+Because the installer runs as the host user, the tree is owned by that user
 and a plain `rm -rf` removes it. The one exception is `setup.log`, written by
 the container's init hook as container-root — which maps to a subuid the host
 user does not own — so `ujust matlab-uninstall` falls back to
@@ -277,8 +284,7 @@ user does not own — so `ujust matlab-uninstall` falls back to
 
 ## The desktop entry
 
-Written on the **host** by `ujust matlab-box`, pointing at
-`fromelicks-matlab-launch`. Deliberately not `distrobox-export`: an exported
+Written on the **host** by `ujust matlab-box`, running `ujust matlab`. Deliberately not `distrobox-export`: an exported
 entry runs `distrobox enter` directly, which under GNOME's default `--no-x11`
 would start MATLAB with no X server at all.
 

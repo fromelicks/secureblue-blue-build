@@ -9,8 +9,6 @@
 # xwayland-satellite starts its own as an ordinary Wayland client -- so this
 # gives X11 apps a hardware-accelerated display without the global toggle, and
 # the server dies with the command instead of outliving the session.
-#
-# Works under Mutter, not just Niri. See docs/matlab-distrobox.md.
 
 set -euo pipefail
 

@@ -1,141 +1,46 @@
 # ── MATLAB / Simulink ──────────────────────────────────────────────────────
 #
-# MATLAB is installed once from the release ISO onto a host directory, and run
-# from a RHEL 9 (UBI) distrobox that supplies the MathWorks-supported
-# userspace. The display is a private Xwayland started per invocation by
-# xwayland-satellite -- secureblue's global `set-xwayland` stays off.
-#
-# The image ships /etc/distrobox/matlab.ini as a TEMPLATE. `matlab-box` seeds
-# a per-machine copy under ~/.config/distrobox/ and works from that, because
-# the license server address is site configuration.
+# MATLAB is installed by hand onto a host directory and run from a RHEL 9 (UBI)
+# distrobox, on a private Xwayland per invocation. See docs/matlab-distrobox.md.
 #
 # ujust runs recipes from /usr/share/ublue-os, so anything that depends on the
 # caller's directory resolves against invocation_directory().
-#
-# See docs/matlab-distrobox.md.
 
-# Install MATLAB from the release ISO. Takes hours; needs the GUI installer.
-[group('MATLAB')]
-[positional-arguments]
-matlab-install iso="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    source /usr/libexec/fromelicks-matlab-env
+matlab_release := "R2026a"
 
-    fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-    cd {{ quote(invocation_directory()) }}
+# Shared by the recipes below. Keep the release in sync with the init_hooks
+# argument in /etc/distrobox/matlab.ini.
+matlab_prelude := '''
+# shellcheck disable=SC2034  # not every recipe uses every path
+set -euo pipefail
+MATLAB_RELEASE="''' + matlab_release + '''"
+MATLAB_BOX=matlab
+MATLAB_INSTALL_DIR="${HOME}/.local/share/matlab-distrobox"
+MATLAB_MANIFEST="${HOME}/.config/distrobox/matlab.ini"
+MATLAB_MANIFEST_TEMPLATE=/etc/distrobox/matlab.ini
+MATLAB_DESKTOP="${HOME}/.local/share/applications/matlab.desktop"
 
-    if matlab_installed; then
-        printf 'MATLAB %s is already installed in %s.\n' "${MATLAB_RELEASE}" "${MATLAB_INSTALL_DIR}"
-        printf 'Re-run the installer anyway to add or remove products.\n\n'
-    fi
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-    iso="${1:-}"
-    if [[ -n "${iso}" ]]; then
-        iso="$(realpath -e -- "${iso}" 2>/dev/null)" || fail "no such file: ${1}"
-    else
-        # Newest match wins, so a later release ISO is picked up without the
-        # recipe naming a version.
-        iso="$(find "${HOME}/Downloads" -maxdepth 3 -iname '*_Linux.iso' -printf '%T@ %p\n' 2>/dev/null |
-               sort -rn | head -1 | cut -d' ' -f2- || true)"
-        [[ -n "${iso}" ]] ||
-            fail "no installer ISO found in ~/Downloads. Pass one: ujust matlab-install /path/to/R2026a_Linux.iso"
-    fi
+matlab_installed() { [[ -x "${MATLAB_INSTALL_DIR}/${MATLAB_RELEASE}/bin/matlab" ]]; }
 
-    mount_of() { findmnt -rn -o TARGET -S "$1" 2>/dev/null | head -1 || true; }
+# Match the NAME column exactly; `grep -w matlab` would also match matlab-dev.
+matlab_box_exists() {
+    distrobox list 2>/dev/null |
+        awk -F'|' -v box="${MATLAB_BOX}" 'NR>1 && $2 ~ "^ *" box " *$" { f=1 } END { exit !f }'
+}
 
-    # Reuse a loop device already attached to this file, mounted or not, rather
-    # than stacking another one on the same 14 GB image.
-    loopdev="$(losetup -j "${iso}" -O NAME -n 2>/dev/null | head -1 || true)"
-    if [[ -z "${loopdev}" ]]; then
-        printf 'Attaching %s\n' "${iso}"
-        # udisks does this unprivileged via polkit, and mounts land under
-        # /run/media/$USER where they are readable as the user.
-        out="$(udisksctl loop-setup -r -f "${iso}" 2>&1)" || fail "could not attach the ISO: ${out}"
-        loopdev="$(sed -n 's/.* as \(\/dev\/loop[0-9]*\).*/\1/p' <<<"${out}")"
-        [[ -n "${loopdev}" ]] || fail "could not parse the loop device from: ${out}"
-    fi
-
-    # Released on exit so the ISO does not stay mounted indefinitely. The next
-    # run attaches it again.
-    # loop-delete on a still-mounted device only arms autoclear and returns 0,
-    # so check the result rather than trusting the exit code.
-    release() {
-        udisksctl unmount -b "${loopdev}" >/dev/null 2>&1 || true
-        udisksctl loop-delete -b "${loopdev}" >/dev/null 2>&1 || true
-        if [[ -n "$(losetup -j "${iso}" -O NAME -n 2>/dev/null)" ]]; then
-            printf 'NOTE: %s is still attached; release it with\n' "${iso}" >&2
-            printf '  udisksctl unmount -b %s && udisksctl loop-delete -b %s\n' "${loopdev}" "${loopdev}" >&2
-        fi
-    }
-    trap release EXIT
-
-    # GNOME automounts loop devices it sees appear, so give it a moment and
-    # only mount if nobody has; losing that race is not an error.
-    mnt=''
-    for _ in {1..20}; do
-        mnt="$(mount_of "${loopdev}")"
-        [[ -n "${mnt}" ]] && break
-        sleep 0.1
-    done
-    if [[ -z "${mnt}" ]]; then
-        out="$(udisksctl mount -b "${loopdev}" 2>&1)" || true
-        mnt="$(mount_of "${loopdev}")"
-        [[ -n "${mnt}" ]] || fail "could not mount ${loopdev}: ${out}"
-    fi
-    printf 'ISO mounted at %s\n\n' "${mnt}"
-
-    [[ -x "${mnt}/install" ]] || fail "${mnt}/install is missing -- is this a MATLAB installer ISO?"
-
-    mkdir -p "${MATLAB_INSTALL_DIR}"
-    avail=$(df -BG --output=avail "${MATLAB_INSTALL_DIR}" | tail -1 | tr -dc '0-9')
-    if (( avail < 80 )); then
-        printf 'WARNING: only %sG free; the full product suite needs roughly 60-80G.\n' "${avail}" >&2
-        read -rp 'Continue anyway? [y/N] ' proceed
-        [[ "${proceed}" == [Yy]* ]] || exit 1
-    fi
-
-    cat <<NOTE
-
-    The MathWorks installer will open on a private X display.
-
-      Destination folder : ${MATLAB_INSTALL_DIR}/${MATLAB_RELEASE}
-      Products           : leave everything selected -- the installer offers
-                           exactly what your license covers, which is the
-                           full suite.
-      License            : log in with your MathWorks account, or use a File
-                           Installation Key plus your network.lic.
-
-    This takes hours. The window belongs to this terminal; closing the
-    terminal ends the install. The ISO is unmounted when it finishes.
-
-    NOTE
-    read -rp 'Start the installer? [Y/n] ' proceed
-    [[ "${proceed}" == [Nn]* ]] && exit 0
-
-    # hardened_malloc kills the installer's CEF front end (MATLABWindow) the
-    # instant it spawns, leaving no window and no error.
-    env -u LD_PRELOAD /usr/libexec/fromelicks-xwayland-isolated "${mnt}/install" || true
-
-    if matlab_installed; then
-        printf '\nInstalled. Next: ujust matlab-box\n'
-    else
-        printf '\nThe installer exited without producing %s/bin/matlab.\n' \
-            "${MATLAB_INSTALL_DIR}/${MATLAB_RELEASE}" >&2
-        exit 1
-    fi
+matlab_manifest_revision() { sed -n 's/^# fromelicks-matlab-manifest: *//p' "$1" 2>/dev/null | head -1; }
+'''
 
 # Create (or re-create) the MATLAB distrobox and the desktop entry.
 [group('MATLAB')]
 matlab-box:
     #!/usr/bin/env bash
-    set -euo pipefail
-    source /usr/libexec/fromelicks-matlab-env
+    {{ matlab_prelude }}
 
-    fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-
-    # secureblue disables container-domain userns via the harden_container_userns
-    # SELinux module. Without it podman cannot create the container at all.
+    # secureblue's harden_container_userns SELinux module blocks podman.
     if [[ "$(ujust set-container-userns status)" != 'enabled' ]]; then
         fail "Container userns is disabled. Run 'ujust set-container-userns on' first."
     fi
@@ -148,8 +53,7 @@ matlab-box:
         exit 0
     fi
 
-    # A copy seeded from an older image can be unusable (the old Ubuntu base no
-    # longer pulls), so re-seed it and carry the license line across.
+    # Re-seed a copy from an older image, keeping its license line.
     template_rev="$(matlab_manifest_revision "${MATLAB_MANIFEST_TEMPLATE}")"
     user_rev="$(matlab_manifest_revision "${MATLAB_MANIFEST}")"
     if (( ${user_rev:-0} < ${template_rev:-0} )); then
@@ -168,46 +72,32 @@ matlab-box:
         fail "${MATLAB_MANIFEST} still has the placeholder license server. Edit MLM_LICENSE_FILE."
     fi
 
-    # podman would create the bind-mount source itself, but doing it here keeps
-    # ownership with the user rather than depending on podman's behaviour.
+    # Created here so the bind-mount source is owned by the user, not podman.
     mkdir -p "${MATLAB_INSTALL_DIR}"
 
-    printf "Assembling the MATLAB box. The first run installs MathWorks' dependencies\n"
-    printf 'inside it; progress appears here, full dnf output in\n'
-    printf '%s/setup.log\n\n' "${MATLAB_INSTALL_DIR}"
+    printf "Assembling the MATLAB box. The first run installs MathWorks' dependencies;\n"
+    printf 'full dnf output goes to %s/setup.log\n\n' "${MATLAB_INSTALL_DIR}"
     distrobox assemble create --replace --file "${MATLAB_MANIFEST}"
 
-    # The installer ships the icon inside the install tree but registers it
-    # nowhere the host icon theme looks. Skip the search once it is in place.
+    # The installer does not register its icon with the host theme.
     icon_dir="${HOME}/.local/share/icons/hicolor/256x256/apps"
+    icon_src="${MATLAB_INSTALL_DIR}/${MATLAB_RELEASE}/bin/glnxa64/cef_resources/matlab_icon.png"
     icon_name='applications-science'
-    if [[ -f "${icon_dir}/matlab.png" ]]; then
+    if [[ -f "${icon_src}" ]]; then
+        install -D -m 0644 "${icon_src}" "${icon_dir}/matlab.png"
         icon_name='matlab'
-    elif matlab_installed; then
-        icon_src="$(find "${MATLAB_INSTALL_DIR}/${MATLAB_RELEASE}/toolbox/shared" \
-            "${MATLAB_INSTALL_DIR}/${MATLAB_RELEASE}/resources" \
-            -name 'matlab_icon*.png' -print -quit 2>/dev/null || true)"
-        if [[ -n "${icon_src}" ]]; then
-            mkdir -p "${icon_dir}"
-            install -m 0644 "${icon_src}" "${icon_dir}/matlab.png"
-            icon_name='matlab'
-        fi
     fi
 
-    # Written on the host, not via distrobox-export, which would run MATLAB
-    # with no X server. StartupWMClass is a guess -- MATLAB's X11 class is its
-    # window title, which embeds the license type; check with
-    # `xprop WM_CLASS` if the taskbar shows a second icon. No %f/MimeType:
-    # MATLAB does not open a file passed as an argument.
-    apps="${HOME}/.local/share/applications"
-    mkdir -p "${apps}"
-    cat > "${apps}/matlab.desktop" <<DESKTOP
+    # Not distrobox-export: that entry would start MATLAB with no X server.
+    # StartupWMClass is a guess; check with `xprop WM_CLASS`.
+    mkdir -p "$(dirname "${MATLAB_DESKTOP}")"
+    cat > "${MATLAB_DESKTOP}" <<DESKTOP
     [Desktop Entry]
     Type=Application
     Name=MATLAB ${MATLAB_RELEASE}
     GenericName=Numerical Computing Environment
     Comment=MATLAB and Simulink
-    Exec=/usr/libexec/fromelicks-matlab-launch
+    Exec=ujust matlab
     Icon=${icon_name}
     Terminal=false
     Categories=Development;Science;Math;IDE;
@@ -215,8 +105,10 @@ matlab-box:
     StartupNotify=true
     StartupWMClass=MATLAB ${MATLAB_RELEASE}
     DESKTOP
-    update-desktop-database "${apps}" 2>/dev/null || true
+    update-desktop-database "$(dirname "${MATLAB_DESKTOP}")" 2>/dev/null || true
 
+    matlab_installed ||
+        warn "MATLAB is not installed in ${MATLAB_INSTALL_DIR}/${MATLAB_RELEASE} yet; see docs/matlab-distrobox.md."
     printf '\nDone. Launch with "ujust matlab" or the MATLAB %s desktop entry.\n' "${MATLAB_RELEASE}"
 
 # Launch MATLAB on a private X display, in the directory ujust was run from.
@@ -224,16 +116,30 @@ matlab-box:
 [positional-arguments]
 matlab *args:
     #!/usr/bin/env bash
-    set -euo pipefail
+    {{ matlab_prelude }}
     cd {{ quote(invocation_directory()) }}
-    exec /usr/libexec/fromelicks-matlab-launch "$@"
+
+    matlab_installed ||
+        fail "MATLAB ${MATLAB_RELEASE} is not installed in ${MATLAB_INSTALL_DIR}; see docs/matlab-distrobox.md."
+    matlab_box_exists ||
+        fail "the '${MATLAB_BOX}' container does not exist. Run 'ujust matlab-box'."
+
+    (( $# )) || set -- -desktop
+    # Escape hatch for broken hardware OpenGL.
+    if [[ "${FROMELICKS_MATLAB_SOFTWARE_OPENGL:-0}" == '1' ]]; then
+        set -- -softwareopengl "$@"
+    fi
+
+    # The X server runs on the host, MATLAB in the box; they share /tmp/.X11-unix.
+    exec /usr/libexec/fromelicks-xwayland-isolated \
+        distrobox enter --name "${MATLAB_BOX}" -- /usr/local/bin/matlab "$@"
 
 # Report the state of the MATLAB setup and everything it depends on.
 [group('MATLAB')]
 check-matlab:
     #!/usr/bin/env bash
-    set -uo pipefail
-    source /usr/libexec/fromelicks-matlab-env
+    {{ matlab_prelude }}
+    set +e
 
     state() { printf '%-24s %s\n' "$1" "$2"; }
 
@@ -243,9 +149,6 @@ check-matlab:
         state 'container userns' 'DISABLED -- ujust set-container-userns on'
     fi
 
-    # The global set-xwayland toggle is deliberately not reported: this setup
-    # runs its own Xwayland, and mentioning it would suggest a needless
-    # security reduction.
     if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
         state 'display' 'not a Wayland session -- xwayland-satellite cannot start'
     elif command -v xwayland-satellite >/dev/null; then
@@ -254,11 +157,10 @@ check-matlab:
         state 'display' 'xwayland-satellite MISSING'
     fi
 
-    # No `du`: the tree is tens of GB, and this is meant to be cheap.
     if matlab_installed; then
         state "MATLAB ${MATLAB_RELEASE}" "installed in ${MATLAB_INSTALL_DIR}"
     else
-        state "MATLAB ${MATLAB_RELEASE}" 'not installed -- ujust matlab-install'
+        state "MATLAB ${MATLAB_RELEASE}" "not installed in ${MATLAB_INSTALL_DIR} -- see docs/matlab-distrobox.md"
     fi
 
     if matlab_box_exists; then
@@ -267,7 +169,7 @@ check-matlab:
         state 'container' 'absent -- ujust matlab-box'
     fi
 
-    if [[ -f "${HOME}/.local/share/applications/matlab.desktop" ]]; then
+    if [[ -f "${MATLAB_DESKTOP}" ]]; then
         state 'desktop entry' 'present'
     else
         state 'desktop entry' 'absent -- ujust matlab-box'
@@ -290,13 +192,10 @@ check-matlab:
 [group('MATLAB')]
 remove-matlab-box:
     #!/usr/bin/env bash
-    set -euo pipefail
-    source /usr/libexec/fromelicks-matlab-env
+    {{ matlab_prelude }}
 
-    # The desktop entry goes first, so it cannot outlive a container that was
-    # already removed some other way.
-    rm -f "${HOME}/.local/share/applications/matlab.desktop"
-    update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
+    rm -f "${MATLAB_DESKTOP}"
+    update-desktop-database "$(dirname "${MATLAB_DESKTOP}")" 2>/dev/null || true
 
     if matlab_box_exists; then
         distrobox rm --force "${MATLAB_BOX}"
@@ -311,8 +210,7 @@ remove-matlab-box:
 [group('MATLAB')]
 matlab-uninstall:
     #!/usr/bin/env bash
-    set -euo pipefail
-    source /usr/libexec/fromelicks-matlab-env
+    {{ matlab_prelude }}
 
     if [[ ! -d "${MATLAB_INSTALL_DIR}" ]]; then
         printf 'Nothing to remove: %s does not exist.\n' "${MATLAB_INSTALL_DIR}"
@@ -320,47 +218,38 @@ matlab-uninstall:
     fi
 
     printf 'This permanently deletes %s\n' "${MATLAB_INSTALL_DIR}"
-    printf 'and everything MATLAB has written into it. Re-installing means\n'
-    printf 'running the ISO installer again.\n\n'
+    printf 'and everything MATLAB has written into it.\n\n'
     read -rp 'Delete it? [y/N] ' proceed
     [[ "${proceed}" == [Yy]* ]] || { printf 'Aborted.\n'; exit 0; }
 
-    # setup.log is written by container-root, i.e. a subuid the host user does
-    # not own, so a plain rm cannot remove that one file.
+    # setup.log belongs to container-root, a subuid the host user does not own.
     rm -rf "${MATLAB_INSTALL_DIR}" 2>/dev/null ||
         podman unshare rm -rf "${MATLAB_INSTALL_DIR}"
-    printf 'Removed. Run "ujust matlab-install" to install again.\n'
+    printf 'Removed.\n'
 
 # Install the Simulink Agentic Toolkit and wire it into Claude Code.
 [group('MATLAB')]
 matlab-agentic-toolkit:
     #!/usr/bin/env bash
-    set -euo pipefail
-    source /usr/libexec/fromelicks-matlab-env
+    {{ matlab_prelude }}
 
     CACHE="${HOME}/.local/share/matlab-agentic-toolkit"
-    warn() { printf 'WARNING: %s\n' "$*" >&2; }
-    fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
     matlab_installed ||
-        fail "MATLAB ${MATLAB_RELEASE} is not installed. Run 'ujust matlab-install' first."
+        fail "MATLAB ${MATLAB_RELEASE} is not installed in ${MATLAB_INSTALL_DIR}."
     matlab_box_exists ||
         fail "the '${MATLAB_BOX}' container does not exist. Run 'ujust matlab-box' first."
 
-    # Fetched on the host and handed to the installer with Offline=true, so a
-    # download failure is a curl error rather than a MATLAB exception.
-    # Refreshed every run, since the URLs track the latest release and the
-    # toolkit repos below are pulled every run too. Downloads land in a temp
-    # file first, so a dropped transfer never replaces a good copy.
+    # Fetched on the host and installed with Offline=true, so download errors
+    # surface here rather than as MATLAB exceptions. Refreshed every run, to
+    # stay in step with the repos pulled below.
     mkdir -p "${CACHE}"
     fetch() {
         local url="$1" dest="${CACHE}/$2" mode="$3" tmp
         tmp="$(mktemp "${dest}.XXXXXX")"
         printf 'Fetching %s\n' "$2"
         if curl -sSfL --retry 3 "${url}" -o "${tmp}"; then
-            # Offline=true copies the file verbatim, mode included; a
-            # non-executable server fails in Claude Code with a bare
-            # "Permission denied".
+            # Offline=true keeps the file mode.
             chmod "${mode}" "${tmp}"
             mv -f "${tmp}" "${dest}"
         else
@@ -377,7 +266,6 @@ matlab-agentic-toolkit:
     fetch "${releases}/matlab/matlab-mcp-server/releases/latest/download/MATLABMCPServerToolbox.mltbx" \
           'MATLABMCPServerToolbox.mltbx' 0644
 
-    # The installer reads the skill catalogue straight out of these clones.
     for repo in simulink-agentic-toolkit matlab-agentic-toolkit; do
         if [[ -d "${CACHE}/${repo}/.git" ]]; then
             git -C "${CACHE}/${repo}" pull --ff-only --quiet ||
@@ -387,10 +275,9 @@ matlab-agentic-toolkit:
         fi
     done
 
-    # MATLAB's own launcher passes only the first line of a multi-line -batch
-    # argument, so the steps go in a script. The directory is under $HOME so
-    # the container sees it, and the file name has no hyphen: run() evaluates
-    # the stem, and `a-b` parses as a subtraction.
+    # -batch keeps only the first line of its argument, so use a script. It
+    # lives under $HOME for the container to see, and has no hyphen in its
+    # name, since run() would parse `a-b` as a subtraction.
     work="$(mktemp -d "${CACHE}/run_XXXXXX")"
     trap 'rm -rf "${work}"' EXIT
     cat > "${work}/fromelicks_satk_setup.m" <<MFILE
@@ -401,12 +288,11 @@ matlab-agentic-toolkit:
         MCPToolboxLocation="${CACHE}/MATLABMCPServerToolbox.mltbx", ...
         SimulinkAgenticToolkitLocation="${CACHE}/simulink-agentic-toolkit", ...
         MATLABAgenticToolkitLocation="${CACHE}/matlab-agentic-toolkit");
-    % `install` does not configure the agent on its own.
+    % "install" does not configure the agent on its own.
     setupAgenticToolkit("configure", Agents="claude-code", Scope="global", Prompt=false);
     setupAgenticToolkit("status");
     MFILE
 
-    # -batch needs no display, but it DOES check out a license.
     printf '\nInstalling into MATLAB. This checks out a license and takes a few minutes.\n\n'
     distrobox enter --name "${MATLAB_BOX}" -- \
         /usr/local/bin/matlab -batch "run('${work}/fromelicks_satk_setup.m')"
@@ -415,19 +301,12 @@ matlab-agentic-toolkit:
 
     cat <<'NOTE'
 
-    Installed. The MCP server entry now lives in ~/.claude.json, which the
-    host Claude Code reads.
-
-    To use it, MATLAB has to be running and sharing its session:
+    Installed. To use it, start MATLAB and share its session:
 
         ujust matlab                 # in one terminal
         >> satk_initialize           # in the MATLAB command window
 
-    satk_initialize calls shareMATLABSession() for you. Then restart Claude
-    Code so it picks up the new MCP server and skills.
-
-    If the server reports it cannot reach MATLAB, see "Reaching MATLAB from
-    Claude Code" in docs/matlab-distrobox.md: a stale session record and a
-    MATLAB busy in pause() look alike and are not.
+    Then restart Claude Code so it picks up the new MCP server and skills.
+    See docs/matlab-distrobox.md if the server cannot reach MATLAB.
 
     NOTE

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# First-start setup for the MATLAB distrobox. Runs as root inside the container
+# First-start setup for the MATLAB environment distrobox. Runs as root inside the container
 # on every start via init_hooks, so it must be idempotent and cheap once done.
 #
-# It does NOT install MATLAB -- `ujust matlab-install` does that from the
-# release ISO, onto a host directory mounted here at /opt/matlab. This only
-# makes the container a MathWorks-supported userspace for it.
+# usage: fromelicks-matlab-box-setup <release>     (e.g. R2026a)
+#
+# A script rather than a ujust recipe: it runs inside the container, where the
+# host's just cannot run (it needs a newer glibc than RHEL 9's).
 #
 # distrobox-enter treats `distrobox:` as progress, `Error:` as fatal, and
 # discards everything else, so bulk dnf output goes to the log file only -- one
@@ -13,11 +14,8 @@
 
 set -euo pipefail
 
-# Invoked as /run/host/usr/libexec/..., so the env file sits beside it.
-# shellcheck source=fromelicks-matlab-env
-source "$(dirname "$0")/fromelicks-matlab-env"
-
-readonly DEST="${MATLAB_CONTAINER_ROOT}"
+readonly MATLAB_RELEASE="${1:?usage: ${0##*/} <release>}"
+readonly DEST="/opt/matlab/${MATLAB_RELEASE}"
 readonly DEPS_STAMP="/var/lib/fromelicks-matlab-deps-${MATLAB_RELEASE}"
 readonly LOG='/opt/matlab/setup.log'
 readonly DEPS_URL="https://raw.githubusercontent.com/mathworks-ref-arch/container-images/main/matlab-deps/${MATLAB_RELEASE,,}/ubi9/base-dependencies.txt"
@@ -57,10 +55,6 @@ if [[ ! -f "${DEPS_STAMP}" ]]; then
 fi
 
 # ── Entry points ───────────────────────────────────────────────────────────
-# Written unconditionally: the container is routinely created before the ISO
-# install finishes, and these are plain execs of a path, so they start working
-# when it lands.
-#
 # Wrappers, not symlinks, because of LD_PRELOAD. secureblue preloads
 # hardened_malloc into every host process, and `distrobox enter` forwards it
 # into the container where those libraries do not exist. It is fatal rather
@@ -69,8 +63,7 @@ fi
 # window and no error.
 #
 # SHELL: distrobox sets a bare `bash`, which MATLAB cannot exec for system().
-# The manifest overrides it container-wide; repeating it here covers boxes
-# assembled from an older manifest.
+# The manifest also overrides it container-wide.
 for tool in matlab mex mbuild; do
     cat > "/usr/local/bin/${tool}" <<WRAPPER
 #!/usr/bin/env bash
