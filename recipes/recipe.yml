@@ -124,6 +124,7 @@ modules:
           - org.gnome.Loupe
           - org.gnome.Calendar
           - org.gnome.Extensions
+          - org.gnome.TextEditor
           - org.gnome.Weather
 
   # These land in /usr/lib/bootc/kargs.d/bluebuild-kargs.toml, which ONLY bootc
