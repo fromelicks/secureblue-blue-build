@@ -30,16 +30,9 @@ modules:
         enable:
           - name: wezfurlong/wezterm-nightly
             chroot: fedora-44-x86_64
-          # DMS publishes Fedora packages and pulls its DankLinux COPR dependency.
-          # Niri itself remains Fedora's package, including its GDM session entry.
           - name: avengemedia/dms
             chroot: fedora-44-x86_64
     install:
-      # DMS accepts any provider of the virtual `quickshell` capability. Terra's
-      # noctalia-qs also provides it, but its IPC/display handling is not
-      # compatible with DMS: the bar loads while modal IPC targets are absent.
-      # Naming quickshell explicitly selects AvengeMedia's package from the
-      # dms COPR dependency repository instead of the Noctalia fork.
       allow-erasing: true
       packages:
         - chezmoi
@@ -74,8 +67,8 @@ modules:
         - syncthing
         - wezterm # repo: copr:copr.fedorainfracloud.org:wezfurlong:wezterm-nightly
         - xpra
+        - xwayland-satellite
         - zed # repo: files:terra.repo
-        # Fedora package installs to system extension path; EGO build is hard-coded to user paths
         - gnome-shell-extension-gsconnect
         - repo: terra
           packages:

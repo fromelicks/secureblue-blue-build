@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# Run a command against a private, rootless X server.
+#
+# usage: fromelicks-xwayland-isolated <command> [args...]
+#
+# secureblue's `set-xwayland off` only passes --no-x11 to gnome-shell, which
+# disables Mutter's built-in Xwayland. /usr/bin/Xwayland is still there, and
+# xwayland-satellite starts its own as an ordinary Wayland client -- so this
+# gives X11 apps a hardware-accelerated display without the global toggle, and
+# the server dies with the command instead of outliving the session.
+
+set -euo pipefail
+
+readonly PROG="${0##*/}"
+
+# Clear of :0-:9, where a session-wide Xwayland or nested compositor sits.
+readonly DISPLAY_MIN=32
+readonly DISPLAY_MAX=63
+readonly READY_TIMEOUT=15
+
+satellite_pid=''
+log_file=''
+
+log() { printf '%s: %s\n' "${PROG}" "$*" >&2; }
+fail() { log "$*"; exit 1; }
+
+cleanup() {
+    local status=$?
+    if [[ -n "${satellite_pid}" ]] && kill -0 "${satellite_pid}" 2>/dev/null; then
+        kill "${satellite_pid}" 2>/dev/null || true
+        for _ in {1..20}; do
+            kill -0 "${satellite_pid}" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -9 "${satellite_pid}" 2>/dev/null || true
+    fi
+    [[ -n "${log_file}" ]] && rm -f "${log_file}"
+    return "${status}"
+}
+trap cleanup EXIT INT TERM
+
+(( $# )) || fail "usage: ${PROG} <command> [args...]"
+
+command -v xwayland-satellite >/dev/null ||
+    fail 'xwayland-satellite is not installed'
+
+# It is a Wayland client first; without a compositor it dies in a backtrace.
+[[ -n "${WAYLAND_DISPLAY:-}" ]] ||
+    fail 'no WAYLAND_DISPLAY; this needs to run inside a Wayland session'
+
+# Check-then-bind cannot be made atomic, so let the bind lose the race and
+# move on rather than computing a number up front. Only an *exit* means the
+# number was taken; a server that stays up but never becomes ready is a real
+# failure, and trying 31 more numbers would just repeat it.
+last_log=''
+for (( n = DISPLAY_MIN; n <= DISPLAY_MAX; n++ )); do
+    [[ -e "/tmp/.X11-unix/X${n}" ]] && continue
+
+    log_file="$(mktemp -t "fromelicks-xwayland-${n}.XXXXXX")"
+    xwayland-satellite ":${n}" >"${log_file}" 2>&1 &
+    satellite_pid=$!
+
+    state='timeout'
+    for (( i = 0; i < READY_TIMEOUT * 10; i++ )); do
+        # The socket appears before xwayland-satellite will serve clients, so
+        # wait for its readiness line instead.
+        if grep -q "Connected to Xwayland on :${n}" "${log_file}" 2>/dev/null; then
+            state='ready'
+            break
+        fi
+        if ! kill -0 "${satellite_pid}" 2>/dev/null; then
+            state='exited'
+            break
+        fi
+        sleep 0.1
+    done
+
+    case "${state}" in
+        ready)
+            break
+            ;;
+        timeout)
+            log "xwayland-satellite :${n} did not become ready within ${READY_TIMEOUT}s; its output:"
+            cat "${log_file}" >&2
+            exit 1
+            ;;
+        exited)
+            wait "${satellite_pid}" 2>/dev/null || true
+            satellite_pid=''
+            last_log="$(cat "${log_file}")"
+            rm -f "${log_file}"
+            log_file=''
+            ;;
+    esac
+done
+
+if [[ -z "${satellite_pid}" ]]; then
+    log "xwayland-satellite exited on every display from :${DISPLAY_MIN} to :${DISPLAY_MAX}; last output:"
+    printf '%s\n' "${last_log}" >&2
+    exit 1
+fi
+
+export DISPLAY=":${n}"
+
+# This Xwayland wants no auth cookie; an inherited XAUTHORITY breaks clients.
+unset XAUTHORITY
+
+"$@"
