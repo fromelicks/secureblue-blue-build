@@ -96,9 +96,11 @@ modules:
       - source: dms-policy
         destination: /
 
+  # Both scripts patch RPM-owned files, so they must run after dnf.
   - type: script
     scripts:
       - patch-dms-lockscreen.sh # See docs/niri-dms.md.
+      - vscode-standard-malloc.sh # See docs/vscode-hardened-malloc.md.
 
   - type: script
     scripts:

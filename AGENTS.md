@@ -83,8 +83,14 @@ These gate multiple features. Verified against secureblue source.
 6. **KVM modules may be blacklisted.** Verify `kvm-intel` is loadable for Firecracker; un-blacklist
    via a `files/system/usr/lib/modprobe.d/` drop-in if blocked.
 7. **Xwayland is off.** Toggle on for Steam/gaming (`ujust set-xwayland on`, needs relogin).
-   Electron apps (VSCode) need `--ozone-platform-hint=auto` for native Wayland.
+   Electron >= 38 picks Wayland by itself (VS Code 1.137 ships Electron 42, no flag needed);
+   only older Electron apps need `--ozone-platform-hint=auto`.
 8. **hardened_malloc is globally preloaded.** Some apps (Steam) require it disabled per-app.
+   **VS Code** is one: Electron aborts with `fatal allocator error`. The image wraps every
+   `code` launcher in `with-standard-malloc` at build time (`vscode-standard-malloc.sh`, after
+   dnf) and ships `/etc/profile.d/zz-fromelicks-vscode-resolve-env.sh`, because VS Code's
+   login-shell environment probe would otherwise put `LD_PRELOAD` back and crash.
+   See [`docs/vscode-hardened-malloc.md`](docs/vscode-hardened-malloc.md).
 9. Trivalent defaults WebRTC to disable_non_proxied_udp — breaks browser-based real-time voice/video (Discord, Meet, Jitsi); relax per-need or use a dedicated client.
 10. **secureblue's `kernel.panic=-1` makes crashes undiagnosable by default.**
     `/usr/lib/sysctl.d/55-hardening.conf` reboots with *zero* delay on panic, so on a KMS
@@ -165,7 +171,8 @@ These gate multiple features. Verified against secureblue source.
 | **gVisor (runsc)** | image | `script` module (NOT in secureblue at all) | collides with userns (constraint 4) + ptrace hardening + needs kvm/seccomp exceptions. Reconsider value on top of existing SELinux+userns hardening. |
 | **JuiceFS** | image (binary) + runtime (mount) | `script` fetches binary; mount via systemd unit; creds via systemd-creds | fuse3 |
 | **rclone** | image (binary) + runtime (mount) | `dnf install rclone`; mount via systemd unit; `rclone.conf` is a secret → systemd-creds/user layer | fuse3 |
-| **distrobox + VSCode** | manifest in image, instance at runtime | distrobox likely present (else `dnf`); ship a `distrobox assemble` manifest in `files/system/etc/distrobox/`; install editor INSIDE the box and `distrobox-export` it | **DECISION NEEDED: VSCode vs VSCodium.** Box needs `set-container-userns on` (constraint 4). |
+| **VS Code** | image | `code` RPM from `vscode.repo` on the host (decided: VS Code, not VSCodium, and not inside a distrobox); launchers wrapped by `vscode-standard-malloc.sh` | Needs the hardened_malloc opt-out (constraint 8). See [`docs/vscode-hardened-malloc.md`](docs/vscode-hardened-malloc.md). |
+| **distrobox dev boxes** | manifest in image, instance at runtime | distrobox likely present (else `dnf`); ship a `distrobox assemble` manifest in `files/system/etc/distrobox/` | Box needs `set-container-userns on` (constraint 4). |
 | **Steam** | run `ujust install-steam` once (recommended) | the helper does hardened_malloc opt-out + a specific flatpak permission set + ia32 karg removal + ptrace/anticheat + Xwayland — the flatpak alone is insufficient | If fully declarative is wanted, bake `com.valvesoftware.Steam` via `default-flatpaks` AND replicate the overrides as a first-boot/user step. |
 | **Syncthing** | image + user service | `dnf install syncthing`; enable as *user* systemd service; open firewall (constraint 2) | device keys are per-machine runtime state |
 | **KeePassXC** | image | `dnf install keepassxc` (better integration than flatpak); key-file unlock, optionally TPM-seal the key file via systemd-creds | **DECISION NEEDED:** auto-unlock convenience vs. "unlocked session = vault exposed" tradeoff. No native TPM-unlock; it's a small systemd-creds wrapper. |
@@ -175,10 +182,9 @@ These gate multiple features. Verified against secureblue source.
 
 ## Open decisions (confirm with the user before implementing)
 
-1. **VSCode vs VSCodium** for the distrobox dev environment.
-2. **Container policy:** which registries to trust, and `insecureAcceptAnything` vs. signed entries.
-3. **Container-userns:** bake a first-boot oneshot, or leave as a manual per-machine toggle.
-4. **KeePassXC quick-unlock:** is the auto-unlock security tradeoff acceptable?
+1. **Container policy:** which registries to trust, and `insecureAcceptAnything` vs. signed entries.
+2. **Container-userns:** bake a first-boot oneshot, or leave as a manual per-machine toggle.
+3. **KeePassXC quick-unlock:** is the auto-unlock security tradeoff acceptable?
 
 ## Scope of what can be done here vs. locally
 
