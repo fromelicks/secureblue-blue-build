@@ -351,9 +351,10 @@ matlab-agentic-toolkit:
     satk_initialize calls shareMATLABSession() for you. Then restart Claude
     Code so it picks up the new MCP server and skills.
 
-    If Claude Code reports that the MCP server cannot reach MATLAB, the
-    host-side server is not finding the container's session -- see the
-    "Reaching MATLAB from Claude Code" section of docs/matlab-distrobox.md
-    for the podman-exec fallback.
+    The host-side server reaches the container's MATLAB directly -- distrobox
+    shares $HOME for session discovery and the host loopback for the connector.
+    If it ever reports that it cannot, see "Reaching MATLAB from Claude Code"
+    in docs/matlab-distrobox.md: a stale session record and a MATLAB busy in
+    pause() look alike and are not.
 
     NOTE

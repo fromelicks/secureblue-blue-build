@@ -282,34 +282,47 @@ hook drops a `/usr/local/bin/claude` shim in the container that forwards to
 
 ### Reaching MATLAB from Claude Code
 
-Claude Code runs on the host; MATLAB runs in the container. The MCP server has
-to bridge that, and there are two ways:
+Claude Code runs on the host; MATLAB runs in the container. **The host-side
+server reaches it, and no extra plumbing is needed** — this is what
+`setupAgenticToolkit` configures by default, and it is verified working here:
 
-1. **Host-side server** — what `setupAgenticToolkit` configures by default.
-   `~/.claude.json` gets a `command` pointing at
-   `~/.matlab/agentic-toolkits/bin/matlab-mcp-server`. Because distrobox shares
-   `$HOME`, `/tmp` and the host network namespace, a session shared from the
-   container with `shareMATLABSession()` may well be discoverable from the
-   host. Try this first — it needs no plumbing.
-2. **In-container server** — if the host-side server cannot find the session,
-   rewrite that `command` to run the server inside the box:
+```
+evaluate_matlab_code -> "2026a" / "<home dir>" / 115     isError: none
+```
 
-   ```json
-   "command": "podman",
-   "args": ["exec", "-i", "matlab", "/var/home/<user>/.matlab/agentic-toolkits/bin/matlab-mcp-server", "--matlab-session-mode=existing"]
-   ```
+It works because distrobox gives the container the host's `$HOME` and network
+namespace. Session discovery reads a record under `$HOME`, and MATLAB's
+connector listens on the host's own loopback (`127.0.0.1:31515`/`31516`), so
+`--matlab-session-mode=existing` finds and attaches to it.
 
-   `podman exec -i` rather than `distrobox enter`, because the latter prints
-   progress lines that would corrupt the MCP stdio stream.
-
-Either way MATLAB has to be running and sharing its session:
+MATLAB has to be running and sharing its session:
 
 ```
 ujust matlab            # one terminal
 >> satk_initialize      # in the MATLAB command window; calls shareMATLABSession()
 ```
 
-Then restart Claude Code so it picks up the new server and skills.
+Then restart Claude Code so it picks up the server and skills.
+
+Two failure modes that look alike and are not:
+
+- **`failed to attach to MATLAB session` / `session is not alive`** — the
+  session record under `$HOME` is stale, pointing at the port of a MATLAB that
+  has exited. Re-run `satk_initialize` in a live session.
+- **The call hangs with no response at all** — MATLAB is alive but its
+  interpreter is *busy*. A session parked in `pause()` cannot service
+  requests; it has to be idle at the prompt.
+
+If a host-side server ever does fail to find the session, the fallback is to
+run it inside the box by rewriting the `command` in `~/.claude.json`:
+
+```json
+"command": "podman",
+"args": ["exec", "-i", "matlab", "<abs path>/matlab-mcp-server", "--matlab-session-mode=existing"]
+```
+
+`podman exec -i` rather than `distrobox enter`, because the latter prints
+progress lines that would corrupt the MCP stdio stream.
 
 ## Known rough edges
 
