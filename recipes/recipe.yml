@@ -102,6 +102,10 @@ modules:
 
   - type: script
     scripts:
+      - vscode-standard-malloc.sh # Must follow dnf: edits files owned by the code RPM.
+
+  - type: script
+    scripts:
       - install-netbird.sh
 
   - type: systemd
