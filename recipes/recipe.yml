@@ -69,7 +69,6 @@ modules:
         - xpra
         - xwayland-satellite
         - zed # repo: files:terra.repo
-        - gnome-shell-extension-gsconnect
         - repo: terra
           packages:
             - terra-release
