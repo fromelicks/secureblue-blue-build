@@ -66,10 +66,17 @@ fi
 # than cosmetic: MATLAB's UI front end (MATLABWindow, a separate CEF process)
 # dies the instant it spawns, leaving a parent spinning at 40% CPU with no
 # window and no error.
+#
+# SHELL is reset for a separate reason. distrobox exports SHELL=bash -- a bare
+# name, not a path -- and MATLAB execs $SHELL directly for every system() call,
+# so an unqualified name fails with 127 and no output. That silently breaks
+# system(), !, mex, make and every Simulink Coder build, and it presents as
+# "command not found" for commands that plainly exist.
 for tool in matlab mex mbuild; do
     cat > "/usr/local/bin/${tool}" <<WRAPPER
 #!/usr/bin/env bash
 unset LD_PRELOAD
+export SHELL=/bin/bash
 exec "${DEST}/bin/${tool}" "\$@"
 WRAPPER
     chmod 0755 "/usr/local/bin/${tool}"
@@ -78,8 +85,22 @@ done
 # setupAgenticToolkit() registers its skills by shelling out to `claude`, which
 # lives on the host. Without this it falls back to symlinks in ~/.claude/skills
 # and the plugin system never learns about the skill packages.
+#
+# The path has to be resolved rather than left to PATH: distrobox-host-exec
+# runs with a minimal host PATH that excludes the Homebrew prefix where
+# Claude Code actually lives. /run/host is the host root, so the container can
+# look the binary up before asking the host to run it.
 cat > /usr/local/bin/claude <<'WRAPPER'
 #!/usr/bin/env bash
+for dir in /home/linuxbrew/.linuxbrew/bin "${HOME}/.local/bin" /usr/local/bin /usr/bin; do
+    # -e/-L rather than -x: the Homebrew entry is an absolute symlink into the
+    # Caskroom, which dangles when resolved from inside the container even
+    # though it is perfectly good on the host.
+    probe="/run/host${dir}/claude"
+    if [[ -e "${probe}" || -L "${probe}" ]]; then
+        exec distrobox-host-exec "${dir}/claude" "$@"
+    fi
+done
 exec distrobox-host-exec claude "$@"
 WRAPPER
 chmod 0755 /usr/local/bin/claude

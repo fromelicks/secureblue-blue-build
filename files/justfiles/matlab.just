@@ -302,6 +302,10 @@ matlab-agentic-toolkit:
           'agenticToolkitInstaller.mltbx'
     fetch 'https://github.com/matlab/matlab-mcp-server/releases/latest/download/matlab-mcp-server-linux-x64' \
           'matlab-mcp-server-linux-x64'
+    # Offline=true copies this file verbatim, mode included, so curl's 0644
+    # would otherwise land a non-executable binary in the install root and
+    # Claude Code's MCP server would fail with a bare "Permission denied".
+    chmod +x "${CACHE}/matlab-mcp-server-linux-x64"
     fetch 'https://github.com/matlab/matlab-mcp-server/releases/latest/download/MATLABMCPServerToolbox.mltbx' \
           'MATLABMCPServerToolbox.mltbx'
 
@@ -326,8 +330,13 @@ matlab-agentic-toolkit:
             MCPToolboxLocation='${CACHE}/MATLABMCPServerToolbox.mltbx', ...
             SimulinkAgenticToolkitLocation='${CACHE}/simulink-agentic-toolkit', ...
             MATLABAgenticToolkitLocation='${CACHE}/matlab-agentic-toolkit');
+        setupAgenticToolkit('configure', Agents=\"claude-code\", Scope=\"global\", Prompt=false);
         setupAgenticToolkit('status');
     "
+
+    # Belt and braces: the copy above is the usual culprit, but the install
+    # root is what Claude Code actually executes.
+    chmod +x "${HOME}/.matlab/agentic-toolkits/bin/matlab-mcp-server" 2>/dev/null || true
 
     cat <<'NOTE'
 

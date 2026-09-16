@@ -114,6 +114,29 @@ Two places drop it:
   `HOME`/`PATH`/`SHELL`/`XDG_*` but not `LD_PRELOAD` — and those libraries do
   not exist in the container anyway.
 
+## distrobox exports SHELL=bash, and MATLAB execs it directly
+
+The second environment trap, and it is worse than it looks.
+
+`distrobox enter` sets `SHELL=bash` — a bare name, not a path. MATLAB `exec`s
+`$SHELL` for every `system()` call, and `exec` does no PATH search, so *every*
+shell-out fails with status 127 and no output:
+
+```
+>> [s,o] = system('/usr/bin/ln --version')
+s = 127
+o = ''
+```
+
+Note that even an absolute path fails, because it is the shell that cannot
+start, not the command. That silently breaks `system()`, `!`, `mex`, `make`
+and every Simulink Coder build, and it presents as "command not found" for
+commands that plainly exist. It is what made the agentic toolkit register
+0 of 183 skills.
+
+The `/usr/local/bin/{matlab,mex,mbuild}` wrappers therefore
+`export SHELL=/bin/bash` alongside unsetting `LD_PRELOAD`.
+
 ## Installing: the ISO, not mpm
 
 The release ISO (`R2026a_Update_4_Linux.iso`, 14 GB) contains the complete
@@ -302,6 +325,11 @@ Then restart Claude Code so it picks up the new server and skills.
 - **Multi-line `-batch`.** `distrobox enter -- matlab -batch "<multi-line>"`
   loses the argument (`No MATLAB command specified`). Put the code in a `.m`
   file and use `-batch "run('/path/to/file.m')"`.
+- **Hyphens in script names.** `run('.../satk-install.m')` fails with
+  `Unrecognized function or variable 'satk'` — `run` evaluates the file *stem*,
+  and `satk-install` parses as a subtraction. Use underscores.
+- **`distrobox enter -- <cmd> --version`** never reaches `<cmd>`; distrobox
+  consumes the flag itself. Wrap it: `distrobox enter -- bash -c '<cmd> --version'`.
 
 ## Installing natively on the host instead
 
