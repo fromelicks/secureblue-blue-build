@@ -83,8 +83,10 @@ These gate multiple features. Verified against secureblue source.
    (removes the module). **DECISION NEEDED:** first-boot oneshot that performs this automatically,
    vs. manual per-machine toggle. (`set-unconfined-userns` is a separate, unrelated toggle.)
 5. **fuse2 removed.** Use fuse3 (JuiceFS/rclone are fine).
-6. **KVM modules may be blacklisted.** Verify `kvm-intel` is loadable for Firecracker; un-blacklist
-   via a `files/system/usr/lib/modprobe.d/` drop-in if blocked.
+6. **KVM: resolved on this hardware.** `kvm_intel` loads (`nested=Y`) and `/dev/kvm` is
+   `crw-rw-rw- root:kvm`; an unprivileged QEMU guest reports `query-kvm` enabled, so the
+   hardening kargs, lockdown and SELinux do not block guests (verified 2026-09-18). Re-check
+   if the base image's karg set changes. Note the Bash sandbox masks `/dev/kvm`.
 7. **Xwayland is off.** Toggle on for Steam/gaming (`ujust set-xwayland on`, needs relogin).
    Electron >= 38 picks Wayland by itself (VS Code 1.137 ships Electron 42, no flag needed);
    only older Electron apps need `--ozone-platform-hint=auto`.
@@ -170,7 +172,8 @@ These gate multiple features. Verified against secureblue source.
 
 | Feature | Where | How | Notes / gotchas |
 |---|---|---|---|
-| **Firecracker** | image | `script` module fetches binary | needs `/dev/kvm` → see constraint 6 |
+| **MicroVMs (krun)** | image | `crun-krun` via `dnf`; run with `podman run --runtime krun` | Decided over Firecracker and Kata (2026-09-18). TSI networking — no tap, forwarding or firewalld zone. Needs container userns (constraint 4); compatible with hardened_malloc. `ujust krun-check`. See [`docs/microvms.md`](docs/microvms.md). |
+| **Firecracker** | not planned | — | Superseded by krun. Revisit only for snapshot/restore or `jailer`; Fedora 44 ships `firecracker` 1.13.1 without `jailer`. |
 | **gVisor (runsc)** | image | `script` module (NOT in secureblue at all) | collides with userns (constraint 4) + ptrace hardening + needs kvm/seccomp exceptions. Reconsider value on top of existing SELinux+userns hardening. |
 | **JuiceFS** | image (binary) + runtime (mount) | `script` fetches binary; mount via systemd unit; creds via systemd-creds | fuse3 |
 | **rclone** | image (binary) + runtime (mount) | `dnf install rclone`; mount via systemd unit; `rclone.conf` is a secret → systemd-creds/user layer | fuse3 |
@@ -212,7 +215,7 @@ These gate multiple features. Verified against secureblue source.
 
 ## Suggested implementation order
 
-Blockers first (they gate the rest): container-policy overlay, firewall rules, KVM-module check,
+Blockers first (they gate the rest): container-policy overlay, firewall rules,
 the system-extension + gschema-override mechanism, container-userns approach. Then features:
-NetBird + Podman → distrobox manifest + editor → Syncthing/KeePassXC → PaperWM/GSConnect → Steam →
-Firecracker (gVisor last / optional).
+NetBird + Podman → distrobox manifest + editor → Syncthing/KeePassXC → PaperWM/GSConnect → Steam.
+gVisor last / optional (krun microVMs are done; see `docs/microvms.md`).
