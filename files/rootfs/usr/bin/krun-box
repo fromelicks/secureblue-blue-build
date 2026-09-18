@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# krun-box: a persistent dev environment in a libkrun microVM (podman --runtime krun).
+#
+#   krun-box [-n NAME] [-c CPUS] [-m RAM_GIB] [-v HOSTDIR[:GUESTDIR]]... [-- CMD [ARGS...]]
+#
+# Every call boots a fresh VM; state lives in the podman volume krun-NAME-home
+# mounted at /root (juliaup, the Julia depot, opencode, configs, shell history).
+# Documented in docs/microvms.md of the fromelicks/secureblue-blue-build repo.
+set -euo pipefail
+
+IMAGE=localhost/krun-box:latest
+CONTEXT=${KRUN_BOX_CONTEXT:-/usr/share/fromelicks/krun-box}
+NAME=dev CPUS=8 RAM_GIB=8
+declare -a mounts=()
+
+usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+while getopts "n:c:m:v:h" opt; do
+    case $opt in
+        n) NAME=$OPTARG ;;
+        c) CPUS=$OPTARG ;;
+        m) RAM_GIB=$OPTARG ;;
+        v) mounts+=("$OPTARG") ;;
+        h) usage 0 ;;
+        *) usage 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[[ $CPUS =~ ^[0-9]+$ ]] && [ "$CPUS" -ge 1 ] && [ "$CPUS" -le 16 ] ||
+    { echo "krun-box: -c must be 1-16 (libkrun's vCPU limit)" >&2; exit 2; }
+[[ $RAM_GIB =~ ^[0-9]+$ ]] && [ "$RAM_GIB" -ge 1 ] ||
+    { echo "krun-box: -m must be a whole number of GiB, at least 1" >&2; exit 2; }
+[[ $NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] ||
+    { echo "krun-box: -n must be letters, digits, '_', '.' or '-'" >&2; exit 2; }
+[ "${1:-}" = "--" ] && shift
+[ "$#" -gt 0 ] || set -- bash -l
+
+# A fixed MCS level per box. With podman's default random level, a file that an
+# installer staged in /tmp (the container's rootfs) and then mv'd into /root keeps
+# that run's private categories, and every later run is denied it by SELinux.
+sum=$(printf '%s' "$NAME" | cksum | cut -d' ' -f1)
+c1=$((sum % 1024)) c2=$(((sum / 1024) % 1024))
+[ "$c1" -eq "$c2" ] && c2=$(((c2 + 1) % 1024))
+[ "$c1" -gt "$c2" ] && { t=$c1; c1=$c2; c2=$t; }
+LEVEL="s0:c$c1,c$c2"
+
+# Guest RAM plus 25% host-side headroom: with --memory equal to guest RAM, the
+# VMM's own overhead drives the cgroup into reclaim once the guest fills its RAM.
+RAM_MIB=$((RAM_GIB * 1024))
+CAP_MIB=$((RAM_MIB * 5 / 4))
+
+args=(--rm --runtime krun --name "krun-$NAME-$$"
+      --security-opt "label=level:$LEVEL"
+      --annotation "krun.cpus=$CPUS" --annotation "krun.ram_mib=$RAM_MIB"
+      --memory "${CAP_MIB}m"
+      -v "krun-$NAME-home:/root"
+      -e "TERM=${TERM:-xterm-256color}")
+
+workdir=/root
+home=$(readlink -f "$HOME")  # /home is a symlink to /var/home on Atomic
+for m in "${mounts[@]}"; do
+    host=${m%%:*} guest=${m#*:}
+    [ "$guest" = "$m" ] && guest=/work/$(basename "$host")
+    case "$guest" in
+        /root | /root/* | / | "") echo "krun-box: guest path $guest would hide the box's home" >&2; exit 1 ;;
+        /*) ;;
+        *) echo "krun-box: guest path must be absolute: $guest" >&2; exit 1 ;;
+    esac
+    host=$(readlink -f "$host")
+    [ -d "$host" ] || { echo "krun-box: not a directory: $host" >&2; exit 1; }
+    # :Z recursively relabels the host directory to this box's categories. That
+    # is only safe on a project directory, so this is an allowlist: at least two
+    # levels inside $HOME (so ~/Repos/foo, never ~/Repos or ~ itself) and not
+    # under any dot-directory. A denylist here once let $HOME through and
+    # relabelled ~900k files.
+    rel=${host#"$home"/}
+    if [ "$rel" = "$host" ] || [ "$rel" = "${rel#*/}" ]; then
+        echo "krun-box: refusing $host -- mount a directory at least two levels inside $home" >&2; exit 1
+    fi
+    case "/$rel" in
+        */.*) echo "krun-box: refusing $host -- it is inside a dot-directory" >&2; exit 1 ;;
+    esac
+    # Only ordinary home content (or content already shared with a container):
+    # special types such as home_bin_t or gpg_secret_t must never be relabelled.
+    setype=$(stat -c %C "$host" | cut -d: -f3)
+    case "$setype" in
+        user_home_t | container_file_t) ;;
+        *) echo "krun-box: refusing $host -- its SELinux type is $setype, not user_home_t" >&2; exit 1 ;;
+    esac
+    args+=(-v "$host:$guest:Z")
+    [ "$workdir" = /root ] && workdir=$guest
+done
+args+=(-w "$workdir")
+
+# Rebuild whenever the shipped Containerfile or setup script changes, so an
+# image update never leaves a stale localhost/krun-box behind. This runs after
+# all argument checks, so a refused mount never triggers a build.
+# --no-cache is required: a fully cached build is committed as a copy of an
+# existing local image, and secureblue's policy.json rejects the
+# containers-storage transport, so that copy fails with "rejected by policy".
+want=$(cat "$CONTEXT"/* | sha256sum | cut -c1-16)
+have=$(podman image inspect -f '{{index .Labels "fromelicks.krun-box.hash"}}' "$IMAGE" 2>/dev/null || true)
+if [ "$want" != "$have" ]; then
+    echo "krun-box: building $IMAGE from $CONTEXT..." >&2
+    podman build -q --no-cache --label "fromelicks.krun-box.hash=$want" -t "$IMAGE" "$CONTEXT" >/dev/null
+    podman image prune -f --filter label=fromelicks.krun-box.hash >/dev/null
+fi
+
+# krun gives the guest process no TTY (checked with crun 1.28 / libkrun 1.19), so
+# for interactive use allocate a pty inside the guest with script(1) and hand it
+# the host terminal's size. Resizing the window later does not propagate.
+if [ -t 0 ] && [ -t 1 ]; then
+    read -r rows cols < <(stty size)
+    printf -v cmd '%q ' "$@"
+    exec podman run -it "${args[@]}" "$IMAGE" \
+        script -qec "stty rows $rows cols $cols; exec $cmd" /dev/null
+else
+    exec podman run -i "${args[@]}" "$IMAGE" "$@"
+fi
