@@ -48,13 +48,15 @@ input, the D-Bus reply to gsd-power) stopped with it.
 ## Why SIGTERM could not recover it
 
 `D` is uninterruptible sleep. A signal sent to a process with a thread in `D`
-stays pending until that thread's kernel call returns. That includes SIGKILL,
-and fatal signals need every thread to exit. `nvkms_ioctl_from_kapi_try_pmlock`
-is where nvidia-drm calls into nvidia-modeset. The thread was waiting there for
-a lock inside the driver that something else held and never released. From
-userspace, nothing short of a reboot can undo that. The existing recovery
-(SIGCONT + SIGTERM, never SIGKILL) was correct for a userspace hang and useless
-here.
+stays pending until that thread's kernel call returns, and a fatal signal needs
+every thread to exit. `ps` also shows `TASK_KILLABLE` waits as `D`, and SIGKILL
+*does* end those, but SIGTERM never does.
+`nvkms_ioctl_from_kapi_try_pmlock` is where nvidia-drm calls into
+nvidia-modeset. The thread was waiting there for a lock inside the driver that
+something else held and never released. The recovery at the time (SIGCONT +
+SIGTERM, never SIGKILL) was correct for a userspace hang and useless here.
+Whether a SIGKILL would have freed it is unknown. If the wait was truly
+uninterruptible, nothing short of a reboot could.
 
 The monitor's own diagnostic reads of `/sys/kernel/debug/dri/*/state` also
 blocked. That produced the repeated `Killed timeout -k 1s 3s head -n 1000`
@@ -78,45 +80,83 @@ Driver at the time: `nvidia-open` 615.71.09, kernel 7.2.5-200.secureblue.1.fc44.
 `gnome-hang-monitor.service` handles this case explicitly. On the attempt that
 triggers recovery (third consecutive failure on a responsive machine):
 
-1. **Blocked-task dump.** If any gnome-shell thread is in `D`, the monitor
-   starts `fromelicks-sysrq-show-blocked.service` before signalling. That unit
-   writes `w` to `/proc/sysrq-trigger`, and the kernel prints the stack of
-   *every* blocked task to its log, lock holder included. It is a separate unit
-   because the monitor runs with `ProtectKernelTunables=yes`, which makes the
-   trigger file read-only for it. The trigger-file path bypasses the
+1. **Kernel dump, before any signal.** If any gnome-shell thread is in `D`, the
+   monitor runs `fromelicks-sysrq-show-blocked.service` and waits for it
+   (bounded to 10 s). That unit writes two sysrq keys:
+   - `w` prints the stack of every task in `D`, which catches a lock holder
+     that is itself blocked;
+   - `l` prints a backtrace of every CPU, which catches a holder that is
+     running or spinning.
+
+   A holder sleeping *interruptibly* shows up in neither. `t` (every task)
+   would catch it, but it can overrun the kernel log buffer. It is a separate
+   unit because the monitor runs with `ProtectKernelTunables=yes`, which makes
+   the trigger file read-only for it. The trigger-file path bypasses the
    `kernel.sysrq` keyboard mask and is not blocked by `lockdown=confidentiality`
    (verified for the dump class with `m`, see
    [`crash-capture.md`](crash-capture.md)). The dump runs once per compositor
-   PID.
-2. **SIGCONT + SIGTERM** as before.
-3. **Driver-wedge check.** If a gnome-shell thread is in `D` with a wait
-   channel in the NVIDIA modules (`nvkms_*`, `nvidia_*`, `nv_*`, `_nv<digits>`),
-   the monitor re-checks every 5 s for `DRIVER_WEDGE_GRACE_SECONDS` (60). If the
-   shell exits or leaves the driver, the pending SIGTERM does its job and
-   nothing more happens. If the thread is still stuck, it runs `sync` (bounded
-   to 60 s) and then an orderly `systemctl reboot`.
+   PID. A failed attempt is retried on the next recovery cycle.
+2. **SIGCONT + SIGTERM** as before. The driver-wedge steps below run only if
+   this signal was actually sent. If recovery is disabled or the PID has
+   changed, nothing further happens.
+3. **Driver-wedge check.** This uses the blocked-thread scan taken before the
+   signal. If one of those threads was waiting on an NVIDIA symbol, the monitor
+   re-checks every 5 s:
+   - if the shell exits or leaves the driver, the pending signal does its job
+     and nothing more happens;
+   - after `DRIVER_WEDGE_KILL_AFTER_SECONDS` (15) it sends **SIGKILL**, which
+     ends a `TASK_KILLABLE` wait. The session is lost either way, and one
+     process is far cheaper than a reboot;
+   - if the thread is still stuck after `DRIVER_WEDGE_GRACE_SECONDS` (60), it
+     runs an orderly `systemctl reboot`.
 
-The match is deliberately narrow: an i915 or generic DRM wait never triggers a
-reboot. Worst-case time from freeze to reboot is about 90 s of failed probes
-plus the 60 s grace.
+**"NVIDIA symbol" means module ownership, not a name prefix.** The driver's
+real lock and wait primitives are `os_acquire_mutex`,
+`os_acquire_rwlock_write`, `os_wait_uninterruptible`, `rm_acquire_gpu_lock` and
+similar, so no prefix list covers them. Meanwhile `nv_*` also matches amdgpu.
+The unit's privileged `ExecStartPre=+…nvidia-symbols` reads `/proc/kallsyms`,
+which the sandbox masks. It collects every text symbol in an `[nvidia*]` module
+and drops names that also exist in another module or in the core kernel, since
+a wait channel is a bare name. On 615.71.09 that is 27,761 names, with 24
+excluded. The list lives at `/run/gnome-diagnostics/nvidia-wchan-symbols`. If
+it is missing, detection is off and the monitor says so at startup. The dump
+and SIGTERM still happen, but there is no SIGKILL escalation and no reboot.
+
+**Config drift cannot shorten the wait.** A non-integer grace (such as `60s`)
+falls back to 60, the grace is clamped to at least 30 s, and the kill step is
+kept inside the grace. An unknown action is treated as `log`.
+
+Worst-case time from freeze to reboot is about 90 s of failed probes plus the
+60 s grace.
 
 ### Opting out
 
 - `DRIVER_WEDGE_ACTION=log` in a drop-in for `gnome-hang-monitor.service`
-  records the wedge and leaves the machine frozen.
-- `run0 -i touch /run/gnome-diagnostics/no-recovery` suppresses both the
-  SIGTERM and the reboot until the next boot. Use this when the frozen state
-  itself needs inspecting.
+  records the wedge and stops there: no SIGKILL escalation, no reboot.
+- `run0 -i touch /run/gnome-diagnostics/no-recovery` suppresses the SIGTERM,
+  the SIGKILL and the reboot. The file lives in the service's
+  `RuntimeDirectory`, so it lasts only until the service **restarts or
+  stops**, not until the next boot. `Restart=always` brings the monitor back
+  with an empty directory, and the opt-out is gone. When inspecting a frozen
+  machine, check the file is still there before relying on it.
 
 ### Why an orderly reboot and not `reboot -f`
 
 The point is to keep the evidence. An orderly shutdown flushes journald and
-unmounts filesystems, so the sysrq-w dump and the monitor's snapshots survive
-into the next boot. The wedged process cannot be killed, but systemd stops
+unmounts filesystems, so the sysrq dump and the monitor's snapshots survive
+into the next boot.
+
+There is deliberately no explicit `sync` first. `sync(2)` sleeps
+uninterruptibly while waiting for writeback, so on a stuck FUSE, network or USB
+mount it would never return. `timeout(1)` waits for its child even after
+SIGKILL, so the reboot would never be reached. The orderly reboot does its own
+flush and unmount, and systemd-shutdown bounds its final sync.
+
+A wedged process that survives SIGKILL cannot be reaped, but systemd stops
 waiting for it after `user@.service`'s stop timeout (1 min here) and carries on.
-If the driver also blocks the final device shutdown, `RebootWatchdogSec=5min`
-(`etc/systemd/system.conf.d/10-watchdog.conf`) and `reboot.target`'s
-`JobTimeoutAction=reboot-force` are the backstops.
+If the driver also blocks the final device shutdown, two backstops apply:
+`RebootWatchdogSec=5min` (`etc/systemd/system.conf.d/10-watchdog.conf`, backed
+by `iTCO_wdt`) and `reboot.target`'s `JobTimeoutAction=reboot-force`.
 
 **Untested end to end:** nobody has yet watched this path reboot a genuinely
 wedged machine. If the orderly reboot itself hangs on the NVIDIA device, the
@@ -126,21 +166,23 @@ how far shutdown got.
 ## After the next occurrence
 
 ```bash
-# The monitor's decisions: wedge detected, grace, reboot
+# The monitor's decisions: wedge detected, SIGKILL, grace, reboot
 journalctl -b -1 -t gnome-diagnostics --no-pager | grep -E 'monitor:'
-# The sysrq-w dump: look for the task holding nvkms / nvidia locks
-journalctl -b -1 -k --no-pager | grep -A40 -E 'sysrq: Show Blocked State'
+# The sysrq dump: blocked tasks, then every CPU's backtrace
+journalctl -b -1 -k --no-pager | grep -A60 -E 'sysrq: (Show Blocked State|Show backtrace of all active CPUs)'
 ```
 
 Look for a task other than gnome-shell with frames in `nvkms_*`, `nv_*`,
 `os_acquire_*` or `rm_*`. That is the lock holder, and it is what an upstream
 NVIDIA bug report needs.
 
-To check the detection by hand against a live shell:
+To check the detection by hand against a live shell (root, because the symbol
+list is in the root-only runtime directory):
 
 ```bash
-/usr/libexec/fromelicks-gnome-hang-monitor blocked "$(pgrep -xo gnome-shell)"
-# prints "tid wchan comm [nvidia]" per D-state thread; exits 1 on an NVIDIA wedge
+run0 /usr/libexec/fromelicks-gnome-hang-monitor blocked "$(pgrep -xo gnome-shell)"
+# prints the D-state threads and the NVIDIA subset
+# exit 0: no NVIDIA wedge, 1: NVIDIA wedge, 2: bad PID / no process / no symbol list
 ```
 
 ## Reproducing and working around
