@@ -70,6 +70,22 @@ validated GNOME Shell PID. This lets GDM recover the graphical session without
 hard-powering off the machine, but the graphical session and its applications
 will be lost. It never escalates to `SIGKILL`.
 
+Two additions cover a hang in the kernel rather than in Shell's main loop. See
+[`nvidia-dpms-lock-hang.md`](nvidia-dpms-lock-hang.md) for the incident that
+motivated them.
+
+- **Blocked-task dump.** If any gnome-shell thread is in uninterruptible sleep
+  (`D`) at that point, the monitor first starts
+  `fromelicks-sysrq-show-blocked.service`. That unit triggers sysrq-w, which
+  writes the kernel stacks of every blocked task to the kernel log. It runs
+  once per compositor PID.
+- **Driver wedge.** A thread blocked in `D` inside the NVIDIA driver keeps
+  every signal pending, SIGKILL included, so SIGTERM cannot recover it. If such
+  a thread is still stuck `DRIVER_WEDGE_GRACE_SECONDS` (60 s) after SIGTERM, the
+  monitor syncs and runs an orderly `systemctl reboot`.
+  `DRIVER_WEDGE_ACTION=log` disables this, and so does the `no-recovery`
+  opt-out below.
+
 For a diagnostic run where the hung process must remain available for manual
 inspection, create the runtime opt-out before reproducing:
 

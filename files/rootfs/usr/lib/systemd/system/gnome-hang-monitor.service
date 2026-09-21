@@ -26,6 +26,16 @@ Environment=PROBE_TIMEOUT_SECONDS=5
 Environment=FAILURE_LIMIT=3
 Environment=RECOVER_HUNG_SHELL=yes
 
+# SIGTERM cannot recover a shell whose thread is blocked inside the NVIDIA
+# kernel driver: the signal stays pending until the driver call returns, and on
+# 2026-09-21 it never did. If such a thread is still blocked this long after
+# SIGTERM, the monitor syncs and runs "systemctl reboot" instead of leaving a
+# frozen lock screen. Set the action to "log" to only record it. The
+# no-recovery runtime opt-out suppresses the reboot too.
+# See docs/nvidia-dpms-lock-hang.md.
+Environment=DRIVER_WEDGE_ACTION=reboot
+Environment=DRIVER_WEDGE_GRACE_SECONDS=60
+
 # Snapshots run detached from the check loop under this hard bound, so a slow
 # collection can no longer stretch the interval between health checks. It MUST
 # stay below CHECK_INTERVAL_SECONDS: only one snapshot may be in flight, so a

@@ -1,0 +1,20 @@
+[Unit]
+Description=Dump the kernel stacks of all blocked (D-state) tasks to the kernel log
+Documentation=https://github.com/fromelicks/secureblue-blue-build/blob/main/docs/nvidia-dpms-lock-hang.md
+# Started on demand by gnome-hang-monitor.service when the compositor has a
+# thread in uninterruptible sleep. The monitor cannot do this itself: its unit
+# sets ProtectKernelTunables=yes, which makes /proc/sysrq-trigger read-only, and
+# relaxing that for one write would reopen every other kernel tunable too.
+#
+# /proc/<pid>/stack needs CAP_SYS_ADMIN, which the monitor does not hold, so its
+# snapshots show "(read failed)" for every kernel stack. sysrq-w prints the
+# stacks of *every* blocked task -- including whichever one holds the lock the
+# compositor is waiting on -- to the kernel log, where journald keeps them.
+#
+# The write bypasses the kernel.sysrq keyboard mask and is not blocked by
+# lockdown=confidentiality (verified with sysrq-m, see docs/crash-capture.md).
+# 'w' only prints; it changes no state.
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo w > /proc/sysrq-trigger'

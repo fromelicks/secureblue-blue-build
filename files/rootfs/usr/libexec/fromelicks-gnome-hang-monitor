@@ -23,6 +23,16 @@ FAILURE_LIMIT=${FAILURE_LIMIT:-3}
 RECOVER_HUNG_SHELL=${RECOVER_HUNG_SHELL:-yes}
 RECOVERY_DISABLE_FILE=$RUNDIR/no-recovery
 
+# A compositor thread in uninterruptible sleep inside the NVIDIA kernel driver
+# cannot be killed: SIGTERM and SIGKILL stay pending until the driver call
+# returns, and on 2026-09-21 it never did. After SIGTERM the monitor waits this
+# long for the wedge to clear, then syncs and reboots in an orderly way rather
+# than leaving a frozen lock screen that only the power button can clear.
+# "log" records the wedge and leaves the machine as it is.
+DRIVER_WEDGE_ACTION=${DRIVER_WEDGE_ACTION:-reboot}
+DRIVER_WEDGE_GRACE_SECONDS=${DRIVER_WEDGE_GRACE_SECONDS:-60}
+BLOCKED_TASKS_DUMP_UNIT=fromelicks-sysrq-show-blocked.service
+
 # Snapshots run detached from the check loop under this hard bound. A collection
 # that outlives it is killed rather than allowed to delay the next health check.
 # Routine snapshots must finish inside one check interval, or a collection
@@ -259,8 +269,8 @@ collect_thread_state() {
     tid=${task##*/}
     comm=$(cat "$task/comm" 2>/dev/null || printf unknown)
     echo "[thread tid=$tid comm=$comm]"
-    printf 'wchan: '
-    print_proc_file "$task/wchan"
+    # wchan has no trailing newline; without one the syscall line runs into it.
+    printf 'wchan: %s\n' "$(cat "$task/wchan" 2>/dev/null || printf '(read failed)')"
     printf 'syscall: '
     print_proc_file "$task/syscall"
     echo "kernel stack:"
@@ -609,6 +619,112 @@ recover_shell() {
   kill -TERM "$live_pid" 2>/dev/null || true
 }
 
+# ── kernel-side wedges ─────────────────────────────────────────────────────
+#
+# SIGTERM only recovers a shell whose main loop is stuck in userspace. When a
+# thread is in uninterruptible sleep inside a driver, the signal stays pending
+# until the driver call returns. On 2026-09-21 gnome-shell's KMS thread blocked
+# in nvkms_ioctl_from_kapi_try_pmlock when gsd-power blanked an NVIDIA-driven
+# display under the lock screen. Three SIGTERMs changed nothing, and the machine
+# needed a hard power-off. See docs/nvidia-dpms-lock-hang.md.
+
+# Print "tid wchan comm" for every thread of $1 in uninterruptible sleep.
+blocked_threads() {
+  local pid="$1" task state wchan comm
+  for task in "/proc/$pid"/task/[0-9]*; do
+    [ -d "$task" ] || continue
+    state=$(awk '/^State:/ { print $2; exit }' "$task/status" 2>/dev/null)
+    [ "$state" = "D" ] || continue
+    wchan=$(cat "$task/wchan" 2>/dev/null)
+    comm=$(cat "$task/comm" 2>/dev/null || printf unknown)
+    printf '%s %s %s\n' "${task##*/}" "${wchan:-unknown}" "$comm"
+  done
+}
+
+# The nvidia, nvidia-modeset and nvidia-drm modules prefix their symbols this
+# way. Deliberately narrow: an i915 or generic DRM wait is not this failure, and
+# a false match here ends in a reboot.
+is_nvidia_wchan() {
+  case "$1" in
+    nvkms_*|nvidia_*|nv_*|_nv[0-9]*) return 0 ;;
+  esac
+  return 1
+}
+
+nvidia_wedged_threads() {
+  local tid wchan comm
+  while read -r tid wchan comm; do
+    [ -n "$tid" ] || continue
+    if is_nvidia_wchan "$wchan"; then
+      printf '%s %s %s\n' "$tid" "$wchan" "$comm"
+    fi
+  done < <(blocked_threads "$1")
+}
+
+# Ask the kernel for the stacks of every blocked task. The compositor's own
+# kernel stacks are unreadable here (/proc/<pid>/stack needs CAP_SYS_ADMIN), and
+# the task that actually holds the lock is usually not the compositor anyway.
+# Once per compositor PID: the output is large and repeats would add nothing.
+DUMPED_BLOCKED_PID=""
+
+dump_blocked_tasks() {
+  local pid="$1" blocked="$2"
+  [ "$DUMPED_BLOCKED_PID" != "$pid" ] || return 0
+  DUMPED_BLOCKED_PID="$pid"
+  log_warn "monitor: gnome-shell PID $pid has thread(s) in uninterruptible sleep: $(printf '%s' "$blocked" | tr '\n' ';'); requesting a sysrq-w dump of all blocked tasks into the kernel log"
+  if ! timeout -k 2s 10s systemctl start --no-block "$BLOCKED_TASKS_DUMP_UNIT" >/dev/null 2>&1; then
+    log_warn "monitor: could not start $BLOCKED_TASKS_DUMP_UNIT; no blocked-task stacks were captured"
+  fi
+}
+
+# Runs after recover_shell. Returns at once unless a compositor thread is stuck
+# inside the NVIDIA driver. Otherwise it waits DRIVER_WEDGE_GRACE_SECONDS for
+# the wedge to clear, then reboots. Blocking the check loop is fine: nothing it
+# could do in the meantime would reach this compositor.
+handle_driver_wedge() {
+  local uid="$1" pid="$2" wedged waited=0
+  wedged=$(nvidia_wedged_threads "$pid")
+  [ -n "$wedged" ] || return 0
+
+  log_err "monitor: gnome-shell PID $pid is blocked inside the NVIDIA driver ($(printf '%s' "$wedged" | tr '\n' ';')); SIGTERM cannot land until that call returns; waiting ${DRIVER_WEDGE_GRACE_SECONDS}s for it to clear"
+
+  while [ "$waited" -lt "$DRIVER_WEDGE_GRACE_SECONDS" ]; do
+    sleep 5
+    waited=$((waited + 5))
+    if [ -e "$SLEEP_MARKER" ]; then
+      log_info "monitor: driver-wedge handling cancelled because system sleep began"
+      return 0
+    fi
+    if ! pid_is_gnome_shell_for_uid "$pid" "$uid"; then
+      log_info "monitor: gnome-shell PID $pid exited ${waited}s after SIGTERM; the driver call returned"
+      return 0
+    fi
+    wedged=$(nvidia_wedged_threads "$pid")
+    if [ -z "$wedged" ]; then
+      log_info "monitor: gnome-shell PID $pid left the NVIDIA driver after ${waited}s; leaving recovery to the pending SIGTERM"
+      return 0
+    fi
+  done
+
+  # Same opt-outs as recover_shell: a diagnostic run that keeps the hung shell
+  # for inspection must not end in a reboot either.
+  if [ "$DRIVER_WEDGE_ACTION" != "reboot" ] ||
+     [ "$RECOVER_HUNG_SHELL" != "yes" ] || [ -e "$RECOVERY_DISABLE_FILE" ]; then
+    log_err "monitor: gnome-shell PID $pid still blocked inside the NVIDIA driver after ${waited}s ($(printf '%s' "$wedged" | tr '\n' ';')); automatic reboot disabled (action=$DRIVER_WEDGE_ACTION); only a reboot will release the display"
+    return 0
+  fi
+
+  log_err "monitor: gnome-shell PID $pid still blocked inside the NVIDIA driver after ${waited}s ($(printf '%s' "$wedged" | tr '\n' ';')); syncing and rebooting"
+  timeout -k 5s 60s sync || log_warn "monitor: sync did not finish within 60s; rebooting anyway"
+  # An orderly reboot, not reboot -f: filesystems unmount and the journal is
+  # flushed, so this incident's evidence survives into the next boot. The
+  # wedged process cannot be killed, but systemd stops waiting for it after
+  # user@.service's stop timeout and carries on.
+  if ! timeout -k 5s 30s systemctl reboot >/dev/null 2>&1; then
+    log_err "monitor: systemctl reboot failed; the machine needs a manual reboot"
+  fi
+}
+
 # Sleep until the next tick boundary rather than for a fixed duration, so the
 # time spent probing can never stretch the interval between health checks.
 wait_for_next_tick() {
@@ -628,7 +744,7 @@ wait_for_next_tick() {
 
 monitor_loop() {
   local uid pid tracked_pid="" failures=0 starved_ticks=0
-  local verdict reason classification detail deadline
+  local verdict reason classification detail deadline blocked
 
   mkdir -p "$RUNDIR"
   log_info "monitor: started (interval=${CHECK_INTERVAL_SECONDS}s timeout=${PROBE_TIMEOUT_SECONDS}s failures=${FAILURE_LIMIT} recovery=${RECOVER_HUNG_SHELL} snapshot_timeout=${SNAPSHOT_TIMEOUT_SECONDS}s)"
@@ -754,7 +870,12 @@ monitor_loop() {
       if [ -e "$SLEEP_MARKER" ]; then
         log_info "monitor: recovery cancelled because system sleep began"
       else
+        # Before signalling: this is evidence about the hang, not about the
+        # teardown that SIGTERM starts.
+        blocked=$(blocked_threads "$pid")
+        [ -z "$blocked" ] || dump_blocked_tasks "$pid" "$blocked"
         recover_shell "$uid" "$pid"
+        handle_driver_wedge "$uid" "$pid"
       fi
       tracked_pid=""
       failures=0
@@ -791,6 +912,23 @@ case "${1:-monitor}" in
       "${3:-}" \
       "${4:-180}"
     ;;
+  blocked)
+    # Prints "tid wchan comm [nvidia]" for each thread of PID in uninterruptible
+    # sleep. Exits non-zero when one is blocked inside the NVIDIA driver -- the
+    # condition that ends in an automatic reboot.
+    pid=${2:?PID required}
+    rc=0
+    while read -r tid wchan comm; do
+      [ -n "$tid" ] || continue
+      if is_nvidia_wchan "$wchan"; then
+        printf '%s %s %s nvidia\n' "$tid" "$wchan" "$comm"
+        rc=1
+      else
+        printf '%s %s %s\n' "$tid" "$wchan" "$comm"
+      fi
+    done < <(blocked_threads "$pid")
+    exit "$rc"
+    ;;
   classify)
     # Prints "starved <evidence>" or "responsive <measurements>". Exits non-zero
     # when the machine is starved, so it can gate a shell command.
@@ -799,7 +937,7 @@ case "${1:-monitor}" in
     [ "${classification%% *}" != "starved" ]
     ;;
   *)
-    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|classify|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]|starvation-snapshot LABEL [REASON] [LOOKBACK]}" >&2
+    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|blocked PID|classify|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]|starvation-snapshot LABEL [REASON] [LOOKBACK]}" >&2
     exit 2
     ;;
 esac
