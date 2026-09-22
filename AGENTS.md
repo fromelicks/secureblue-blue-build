@@ -175,7 +175,7 @@ These gate multiple features. Verified against secureblue source.
 
 | Feature | Where | How | Notes / gotchas |
 |---|---|---|---|
-| **MicroVMs (krun)** | image | `crun-krun` via `dnf`; run with `podman run --runtime krun` | Decided over Firecracker and Kata (2026-09-18). TSI networking — no tap, forwarding or firewalld zone. Needs container userns (constraint 4); compatible with hardened_malloc. `ujust krun-check`. See [`docs/microvms.md`](docs/microvms.md). |
+| **MicroVMs (krun)** | image | `crun-krun` via `dnf`; run with `podman run --runtime krun` | Decided over Firecracker and Kata (2026-09-18). TSI networking — no tap, forwarding or firewalld zone. Needs container userns (constraint 4); compatible with hardened_malloc. `ujust krun-check`. Daily use via `/usr/bin/krun-box` (`ujust krun-box`): persistent `krun-NAME-home` volume at `/root`, allowlisted `:Z` project mounts. **krun has no `podman exec`, so distrobox/toolbox cannot use it**; no guest TTY (script(1) workaround); needs a fixed MCS level per box; memory is outside `app.slice`. See [`docs/microvms.md`](docs/microvms.md). |
 | **Firecracker** | not planned | — | Superseded by krun. Revisit only for snapshot/restore or `jailer`; Fedora 44 ships `firecracker` 1.13.1 without `jailer`. |
 | **gVisor (runsc)** | image | `script` module (NOT in secureblue at all) | collides with userns (constraint 4) + ptrace hardening + needs kvm/seccomp exceptions. Reconsider value on top of existing SELinux+userns hardening. |
 | **JuiceFS** | image (binary) + runtime (mount) | `script` fetches binary; mount via systemd unit; creds via systemd-creds | fuse3 |

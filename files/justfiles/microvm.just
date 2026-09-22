@@ -26,3 +26,11 @@ krun-check:
         exit 1
     fi
     echo "OK: the container ran in its own kernel"
+
+# All arguments go to /usr/bin/krun-box unchanged; run `krun-box -h` for usage.
+# Open a persistent dev shell (Julia/opencode) in a krun microVM.
+[group('MicroVM')]
+[positional-arguments]
+krun-box *args:
+    #!/usr/bin/env bash
+    exec krun-box "$@"

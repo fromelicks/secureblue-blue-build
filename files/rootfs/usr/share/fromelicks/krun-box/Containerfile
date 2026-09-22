@@ -1,0 +1,8 @@
+# Base for krun-box microVMs. Tools only: Julia (juliaup) and opencode are
+# installed into the persistent /root volume on first run, so their own
+# self-updaters keep working and nothing is lost when this image is rebuilt.
+FROM registry.access.redhat.com/ubi9/ubi:latest
+RUN dnf -y install git unzip less ncurses procps-ng findutils \
+    && dnf clean all
+COPY krun-box-setup /usr/local/bin/krun-box-setup
+ENV PATH=/root/.juliaup/bin:/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
