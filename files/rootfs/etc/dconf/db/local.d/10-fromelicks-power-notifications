@@ -1,0 +1,40 @@
+# Keep gsd-power's "Automatic Suspend" warning off the lock screen, so the
+# machine stops lighting its own panel back up the moment it blanks it.
+#
+# gsd-power gives that warning no fixed lead time. idle_configure() schedules it
+# at sleep-inactive-*-timeout * IDLE_DELAY_TO_IDLE_DIM_MULTIPLIER, and that
+# multiplier is 1.0/2.0, with no relation to idle-delay at all. On this machine
+# that puts the AC warning (1800/2 = 900 s) on exactly the same idle second as
+# the screen blank (idle-delay 900) -- a race -- and 15 minutes before the
+# suspend it announces.
+#
+# Whenever the blank wins that race, GNOME Shell's lock screen answers the new
+# notification source with unlockDialog.js's
+# NotificationsBox._wakeUpScreenForSource(), which emits
+# org.gnome.ScreenSaver.WakeUpScreen; gsd-power's handle_wake_up_screen() turns
+# that into a 15-second "temporary unidle" that powers the panel back on.
+#
+# The wake-up is gated on source.policy.showInLockScreen, which ANDs the master
+# setting with this per-application one. gsd-power tags every notification it
+# posts with desktop-entry=gnome-power-panel, so declining lock-screen
+# notifications for that one app cuts the whole path, whichever way the race
+# goes. The banner still shows normally while the screen is on, and no other
+# application is affected.
+#
+# Trade-off: low/critical battery warnings share that desktop-entry, so they no
+# longer appear on the lock screen either. They still appear while the screen is
+# on, and the critical-battery action itself is untouched.
+#
+# This cannot be a gschema override: glib's override parser accepts the
+# [schema:path] form for a relocatable schema without complaint and then
+# ignores it, so only a dconf system database reaches this path. And the
+# keyfile alone is inert -- files/scripts/compile-dconf-db.sh compiles it into
+# /etc/dconf/db/local at build time. See docs/idle-suspend-screen-wake.md.
+#
+# application-children is deliberately not set: GNOME Shell's
+# NotificationApplicationPolicy.store() adds gnome-power-panel to the user
+# database itself the first time gsd-power posts anything.
+
+[org/gnome/desktop/notifications/application/gnome-power-panel]
+application-id='gnome-power-panel.desktop'
+show-in-lock-screen=false
