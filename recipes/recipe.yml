@@ -99,6 +99,13 @@ modules:
     scripts:
       - install-netbird.sh
 
+  # Unpacks Anthropic's signed .deb (there is no RPM yet) and wraps the
+  # launcher in with-standard-malloc. After dnf: needs `ar` from binutils.
+  # See docs/claude-desktop.md.
+  - type: script
+    scripts:
+      - install-claude-desktop.sh
+
   - type: systemd
     system:
       enabled:
