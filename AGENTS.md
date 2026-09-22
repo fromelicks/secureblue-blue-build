@@ -55,6 +55,7 @@ touching the relevant subsystem.
 | Intermittent speaker xruns | [`docs/hda-pipewire-xruns.md`](docs/hda-pipewire-xruns.md) | One boot produced quiet, noisy, choppy ALC257 speaker output in both Niri and GNOME. PipeWire timer scheduling repeatedly drained the ALSA buffer; IRQ scheduling was clean, and reboot restored the default timer path. No workaround is enabled; the doc contains capture steps and a scoped WirePlumber fallback. |
 | Desktop freezes under load | [`docs/desktop-responsiveness.md`](docs/desktop-responsiveness.md) | The hardening kargs make `fork`+`exec` ~3.3 ms (vs 0.5–1 ms stock), so fork-heavy apps starve the compositor. Fix: `session.slice` ≫ `app.slice` CPU/IO weights, `io.cost` to make `IOWeight` work on NVMe, and a starvation classifier so the hang monitor stops mistaking overload for a wedged shell. |
 | Desktop hangs under memory pressure | [`docs/memory-pressure-hangs.md`](docs/memory-pressure-hangs.md) | zram is a compression layer, not a storage tier, and there was no disk swap: `zed-editor` itself reached 26.3 GiB (the OOM dump's only `julia` process was 0.35 GiB — unlike the 2026-08-26 Julia-LSP incident in `desktop-responsiveness.md`), swap hit 120 kB free of 8 GiB, and the global OOM killer fired after a 15-minute freeze. `CPUWeight` cannot help a task stuck in direct reclaim, and `MemoryLow` was breached 19,985 times. Fix: `MemoryMin` across the whole ancestor chain (non-uniform — `user.slice` needs headroom, and `memory_recursiveprot` leaks unclaimed surplus to `app.slice`), `MemoryHigh=65%` on `app.slice` with `ManagedOOMMemoryPressureLimit=95%` because the throttle *creates* the PSI oomd kills on, a `workload.slice` escape hatch, and a per-machine `/var/swapfile`. `MemoryMax` is a *thrash* limit, not a burst limit. `ManagedOOMPreference=omit` is ignored on user-owned cgroups. |
+| Idle suspend wakes the screen | [`docs/idle-suspend-screen-wake.md`](docs/idle-suspend-screen-wake.md) | gsd-power pins its `Automatic Suspend` warning to `sleep_timeout / 2`, with no relation to `idle-delay`; on this machine's AC settings (900 s / 1800 s) it lands on the same idle second as the screen blank, and 15 min before the suspend it announces. When the blank wins, the lock screen deliberately powers the panel back on for it (`_wakeUpScreenForSource` → `org.gnome.ScreenSaver.WakeUpScreen` → gsd-power's 15 s temporary unidle). Fixed by declining lock-screen notifications for `gnome-power-panel` in a dconf system database. Relocatable-schema paths CANNOT be set from a gschema override — glib accepts and ignores them. |
 | GNOME hang detection | [`docs/gnome-hang-monitor.md`](docs/gnome-hang-monitor.md) | Continuous `org.gnome.Shell.Eval` probe with detached, bounded diagnostics and automatic session recovery. |
 | Spontaneous instant reboots | [`docs/crash-capture.md`](docs/crash-capture.md) | secureblue's `kernel.panic=-1` reboots in zero seconds, EFI pstore is off, ramoops was unconfigured and this firmware has no BERT — so a panic left *no* evidence anywhere. Fix: `kernel.panic=30` override plus ramoops on a `reserve_mem=` named region. |
 | Recipe kargs never reaching the cmdline | [`docs/kernel-arguments.md`](docs/kernel-arguments.md) | `kargs.d` is a **bootc-only** interface that rpm-ostree ignores silently, and bootc applies it as a *delta*, not desired state — so a karg first shipped under an rpm-ostree deployment is unreachable forever. Repair with `bootc loader-entries set-options-for-source`. Includes the `run0` quoting and SELinux gotchas. |
@@ -170,6 +171,22 @@ These gate multiple features. Verified against secureblue source.
     source has to be dropped by hand with the same command and no `--options`. Check with
     `grep x-options-source /boot/loader/entries/*.conf`.
     See [`docs/kernel-arguments.md`](docs/kernel-arguments.md).
+
+
+14. **dconf defaults keyed by a *path* need a dconf database, not a gschema
+    override.** `glib-compile-schemas --strict` accepts the relocatable
+    `[schema-id:/dconf/path/]` stanza in a `.gschema.override` file and then
+    silently ignores it (verified on `glib2-2.88.3`; a plain `[schema-id]`
+    stanza in the same file does take effect). Anything under a relocatable
+    schema — per-application notification policy, per-device input settings,
+    custom keybindings — has to go in `files/rootfs/etc/dconf/db/local.d/`.
+    The keyfile alone is inert: GSettings reads the compiled binary
+    `/etc/dconf/db/local`, so `files/scripts/compile-dconf-db.sh` runs
+    `dconf compile` at build time. dconf validates nothing against schemas, so
+    a mistyped path compiles cleanly and does nothing — that script reads every
+    key back afterwards, and new keys must be added to its `expected` array.
+    `files/gschema-overrides/` stays the right place for fixed schema ids.
+    See [`docs/idle-suspend-screen-wake.md`](docs/idle-suspend-screen-wake.md).
 
 ## Feature implementation plan
 

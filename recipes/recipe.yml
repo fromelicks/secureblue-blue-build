@@ -106,6 +106,13 @@ modules:
     scripts:
       - install-claude-desktop.sh
 
+  # Compiles /etc/dconf/db/local from the keyfiles the files module dropped in
+  # local.d/. Runs after dnf so a package that ships its own local.d/ drop-in is
+  # picked up too. See docs/idle-suspend-screen-wake.md.
+  - type: script
+    scripts:
+      - compile-dconf-db.sh
+
   - type: systemd
     system:
       enabled:
