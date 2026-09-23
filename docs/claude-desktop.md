@@ -71,6 +71,27 @@ is plain C++ that runs fine under hardened_malloc. Terminals and Claude Code
 sessions started from the app get the resolved login environment, so they keep
 hardened_malloc like any other shell.
 
+## Icon and URL-handler caches
+
+GNOME does not read `/usr/share/icons/hicolor` and `/usr/share/applications`
+directly; it reads `icon-theme.cache` and `mimeinfo.cache`. Both are generated
+by RPM scriptlets during the dnf module, which runs *before* this script, so
+the first version of this install shipped the icon files but no cache entry:
+the app grid showed a blank tile, and `claude://` links had no handler.
+
+GTK normally notices a cache older than its directory and falls back to
+scanning. That cannot happen here: ostree sets every mtime to epoch 0, so the
+cache never looks stale and GTK trusts it completely.
+
+The script therefore ends by running `gtk-update-icon-cache --force` and
+`update-desktop-database`, then greps both caches for the new entries, because
+the whole failure mode is a cache that is silently out of date. The icon cache
+is binary and `strings` can prepend a stray byte to the name, so that grep
+anchors only the end of the line.
+
+Any future module that drops files into either directory after the dnf step
+needs the same treatment.
+
 ## Chromium sandbox
 
 The `.deb` ships `chrome-sandbox` as `4755 root`, as a fallback for systems
@@ -102,4 +123,8 @@ rpm -qf /usr/lib/claude-desktop 2>&1   # "not owned by any package": expected
 cat /usr/lib/claude-desktop/version
 cat /usr/bin/claude-desktop            # the with-standard-malloc wrapper
 claude-desktop                         # or "Claude" in the app grid
+
+# The app grid icon: both must print a match
+strings /usr/share/icons/hicolor/icon-theme.cache | grep claude-desktop
+grep x-scheme-handler/claude /usr/share/applications/mimeinfo.cache
 ```
