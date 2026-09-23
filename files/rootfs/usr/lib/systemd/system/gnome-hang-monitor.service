@@ -5,6 +5,12 @@ After=gdm.service systemd-logind.service
 
 [Service]
 Type=simple
+# "+" runs this step outside the sandbox below. ProtectKernelTunables= masks
+# /proc/kallsyms, and the monitor needs to know which symbol names belong to the
+# NVIDIA modules to recognise a thread wedged inside that driver. The list lands
+# in the RuntimeDirectory, which is recreated on every restart, so it is rebuilt
+# along with it. "-": a failure leaves NVIDIA detection off, never the monitor.
+ExecStartPre=-+/usr/libexec/fromelicks-gnome-hang-monitor nvidia-symbols
 ExecStart=/usr/libexec/fromelicks-gnome-hang-monitor monitor
 Restart=always
 RestartSec=10s
@@ -25,6 +31,19 @@ Environment=CHECK_INTERVAL_SECONDS=30
 Environment=PROBE_TIMEOUT_SECONDS=5
 Environment=FAILURE_LIMIT=3
 Environment=RECOVER_HUNG_SHELL=yes
+
+# SIGTERM cannot recover a shell whose thread is blocked inside the NVIDIA
+# kernel driver: the signal stays pending until the driver call returns, and on
+# 2026-09-21 it never did. For such a shell only, the monitor sends SIGKILL
+# KILL_AFTER seconds after SIGTERM, and if the thread is still blocked after
+# GRACE seconds it runs an orderly "systemctl reboot" instead of leaving a
+# frozen lock screen. Set the action to "log" to only record it. The
+# no-recovery runtime opt-out suppresses the SIGKILL and the reboot too. Plain
+# integers only; the script clamps GRACE to at least 30.
+# See docs/nvidia-dpms-lock-hang.md.
+Environment=DRIVER_WEDGE_ACTION=reboot
+Environment=DRIVER_WEDGE_KILL_AFTER_SECONDS=15
+Environment=DRIVER_WEDGE_GRACE_SECONDS=60
 
 # Snapshots run detached from the check loop under this hard bound, so a slow
 # collection can no longer stretch the interval between health checks. It MUST

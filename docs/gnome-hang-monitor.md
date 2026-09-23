@@ -68,7 +68,26 @@ still leaves enough to find where the main loop was blocked.
 After three failed checks, it sends `SIGCONT` followed by `SIGTERM` to the same
 validated GNOME Shell PID. This lets GDM recover the graphical session without
 hard-powering off the machine, but the graphical session and its applications
-will be lost. It never escalates to `SIGKILL`.
+will be lost. It escalates to `SIGKILL` only in the driver-wedge case below.
+
+Two additions cover a hang in the kernel rather than in Shell's main loop. See
+[`nvidia-dpms-lock-hang.md`](nvidia-dpms-lock-hang.md) for the incident that
+motivated them.
+
+- **Kernel dump.** If any gnome-shell thread is in uninterruptible sleep
+  (`D`) at that point, the monitor first runs
+  `fromelicks-sysrq-show-blocked.service` and waits for it (up to 10 s). That
+  unit triggers sysrq-w (stacks of every blocked task) and sysrq-l (every CPU's
+  backtrace) into the kernel log. It runs once per compositor PID and is
+  retried if it fails.
+- **Driver wedge.** SIGTERM cannot recover a thread blocked in `D` inside the
+  NVIDIA driver. "Inside the driver" is decided by module ownership, using a
+  symbol list the unit builds from `/proc/kallsyms` at start. If SIGTERM was
+  actually sent and such a thread is still stuck 15 s later, the monitor sends
+  SIGKILL. If it is still stuck after `DRIVER_WEDGE_GRACE_SECONDS` (60 s), the
+  monitor runs an orderly `systemctl reboot`, with no separate `sync` because
+  `sync(2)` can itself hang unkillably. `DRIVER_WEDGE_ACTION=log` disables the
+  SIGKILL and the reboot, and so does the `no-recovery` opt-out below.
 
 For a diagnostic run where the hung process must remain available for manual
 inspection, create the runtime opt-out before reproducing:
@@ -84,7 +103,10 @@ run0 -i rm /run/gnome-diagnostics/no-recovery
 ```
 
 The opt-out is ephemeral and is cleared when the service restarts or the
-machine reboots.
+machine reboots. It lives in the service's `RuntimeDirectory`, and
+`Restart=always` recreates that directory empty, so a monitor restart silently
+re-arms recovery, including the driver-wedge reboot. Check that the file still
+exists before relying on it.
 
 The monitor pauses while the system sleep hook is active. The sleep hook still
 captures immediate pre-suspend and post-resume state, but no longer launches a
