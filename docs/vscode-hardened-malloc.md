@@ -29,20 +29,28 @@ so glibc skips it for unprivileged processes. Removing `LD_PRELOAD` is enough.
 Runs after the dnf module, because every file it edits is owned by the `code`
 RPM and a `files/rootfs` copy would be overwritten by the install.
 
-- The `Exec=` lines of `code.desktop` (including the "New Empty Window"
-  action) and `code-url-handler.desktop` are prefixed with
+- Every `Exec=` line that runs `/usr/share/code/code` (the application entry,
+  its "New Empty Window" action and the URL handler) is prefixed with
   `/usr/bin/with-standard-malloc`, the helper secureblue ships for exactly
   this (`LD_PRELOAD='' exec -- "$@"`; also exposed as
   `ujust with-standard-malloc`).
 - The `/usr/bin/code` symlink becomes a wrapper that runs
   `/usr/share/code/bin/code` through the same helper.
 
-The script fails the build if a desktop file has no `Exec=` line, if any
-`Exec=` line is left unwrapped, or if `/usr/bin/code` is no longer a symlink to
-`/usr/share/code/bin/code`, so an upstream packaging change is caught at build
-time. The check deliberately avoids a `grep | grep` pipeline: with `pipefail`,
-a first `grep` that finds nothing, or is killed by SIGPIPE, made the check
-pass.
+The desktop files are found by that `Exec=` line rather than by name, because
+**1.139.0 renamed them** from `code.desktop` and `code-url-handler.desktop` to
+`com.microsoft.VSCode.desktop` and `com.microsoft.VSCode.UrlHandler.desktop` —
+the first change to those names since 1.78.0, and it broke the build. The
+`Exec=` paths, the `/usr/bin/code` symlink and `Icon=vscode` were untouched by
+that rename. Note the app ID changed with the filename, so a dash pin or
+anything else naming `code.desktop` has to be re-created.
+
+The script fails the build if fewer than two desktop files run that launcher,
+if any `Exec=` line is left unwrapped, or if `/usr/bin/code` is no longer a
+symlink to `/usr/share/code/bin/code`, so an upstream packaging change is
+caught at build time. The per-file check deliberately avoids a `grep | grep`
+pipeline: with `pipefail`, a first `grep` that finds nothing, or is killed by
+SIGPIPE, made the check pass.
 
 ### 2. The shell-environment probe (`/etc/profile.d/zz-fromelicks-vscode-resolve-env.sh`)
 

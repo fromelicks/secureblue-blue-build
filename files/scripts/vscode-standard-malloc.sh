@@ -24,8 +24,15 @@ fail() {
 
 [ -x "$wrap" ] || fail "$wrap is missing from the base image"
 
-for desktop in /usr/share/applications/code.desktop \
-               /usr/share/applications/code-url-handler.desktop; do
+# 1.139.0 renamed the desktop files to reverse-DNS IDs (code.desktop ->
+# com.microsoft.VSCode.desktop), so find them by the launcher they run.
+mapfile -t desktops < <(
+    grep -lE '^Exec=/usr/share/code/code([[:space:]]|$)' /usr/share/applications/*.desktop
+)
+[ "${#desktops[@]}" -ge 2 ] ||
+    fail "found ${#desktops[@]} desktop files launching /usr/share/code/code, expected the application and URL-handler entries"
+
+for desktop in "${desktops[@]}"; do
     sed -i "s|^Exec=/usr/share/code/code|Exec=${wrap} /usr/share/code/code|" "$desktop"
     # At least one Exec= line, and every one of them wrapped. No pipeline:
     # under pipefail a failing or SIGPIPE'd grep would read as success.
