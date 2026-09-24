@@ -62,18 +62,60 @@ The monitor's own diagnostic reads of `/sys/kernel/debug/dri/*/state` also
 blocked. That produced the repeated `Killed timeout -k 1s 3s head -n 1000`
 lines, because reading nvidia-drm's atomic state takes the same locks.
 
-## What is still unknown
+## Root cause: a DIFR prefetch holds the nvkms lock
 
-**Which task held the lock.** The snapshot's kernel stacks all read
-`(read failed)`. `/proc/<pid>/stack` needs `CAP_SYS_ADMIN`, which the monitor
-deliberately does not hold, and it lists only gnome-shell's threads anyway. The
-holder could be an NVIDIA kernel worker, a runtime-PM transition of the dGPU
-(`Runtime D3 status: Enabled (fine-grained)`), or another DRM client.
+Identified on **2026-09-23**, the third occurrence and the first with the
+recovery in this document deployed. Its sysrq dump caught both sides.
 
-**Whether earlier "hangs on the lock screen" were the same bug.** The ten
-previous boots contain neither this wait channel nor a `PowerSaveMode` timeout.
+The victim is a display modeset, waiting on a **semaphore** — `down()`, not the
+GPU:
 
-Driver at the time: `nvidia-open` 615.71.09, kernel 7.2.5-200.secureblue.1.fc44.
+```
+down+0x47/0x60
+nvkms_ioctl_from_kapi_try_pmlock+0x4a/0xa0 [nvidia_modeset]
+ApplyModeSetConfig+0x174/0xe30 [nvidia_modeset]
+nv_drm_atomic_apply_modeset_config+0x5dd/0x6a0 [nvidia_drm]
+drm_atomic_check_only → drm_atomic_commit → drm_mode_atomic_ioctl → ioctl
+```
+
+The holder is the driver's own kthread, and it is **running, not blocked**:
+
+```
+CPU: 11  PID: 553  Comm: nvidia-modeset/
+RIP: nvWriteGpEntry+0x40/0x3f0 [nvidia_modeset]
+ nvPushKickoff
+ PrefetchHelperSurfaceEvo
+ nvDIFRPrefetchSurfaces            ← DIFR = Display Idle Frame Refresh
+ DifrPrefetchEventDeferredWork
+ nvkms_kthread_q_callback
+ _main_loop → kthread
+```
+
+DIFR is NVIDIA's display idle power-saving path. A prefetch takes the global
+nvkms lock and wedges while pushing GPU commands, and every compositor modeset
+then queues behind it — which is why each occurrence coincides with the display
+blanking or waking.
+
+**`sysrq-l` is what found it, not `sysrq-w`.** The holder was running, so the
+blocked-task dump alone would have shown the victim a third time. That key was
+added during review of the same PR that shipped the dump.
+
+**SIGKILL does not help.** The 2026-09-23 run escalated on schedule and the
+thread stayed in `D`, so this is a genuinely uninterruptible wait rather than a
+`TASK_KILLABLE` one.
+
+**No driver-side off switch that I can confirm.** `nvidia_modeset` exposes no
+DIFR parameter, and `nvidia.ko` only carries the RM control names
+(`subdeviceCtrlCmdLpwrDifrCtrl`, `subdeviceCtrlCmdLpwrDifrPrefetchResponse`),
+so DIFR is governed inside GSP firmware. Do not invent a registry key for it.
+Not blanking the display remains the only workaround backed by evidence.
+
+Still open: whether the "hangs on the lock screen" from before this document
+were the same bug. The boots preceding 2026-09-21 contain neither the wait
+channel nor a `PowerSaveMode` timeout.
+
+Seen on `nvidia-open` 615.71.09 with kernels 7.2.5 and 7.2.7
+(`-200.secureblue.1.fc44`).
 
 ## What the image now does
 
@@ -152,16 +194,46 @@ mount it would never return. `timeout(1)` waits for its child even after
 SIGKILL, so the reboot would never be reached. The orderly reboot does its own
 flush and unmount, and systemd-shutdown bounds its final sync.
 
-A wedged process that survives SIGKILL cannot be reaped, but systemd stops
-waiting for it after `user@.service`'s stop timeout (1 min here) and carries on.
-If the driver also blocks the final device shutdown, two backstops apply:
-`RebootWatchdogSec=5min` (`etc/systemd/system.conf.d/10-watchdog.conf`, backed
-by `iTCO_wdt`) and `reboot.target`'s `JobTimeoutAction=reboot-force`.
+### The orderly reboot did not finish, and why it does now
 
-**Untested end to end:** nobody has yet watched this path reboot a genuinely
-wedged machine. If the orderly reboot itself hangs on the NVIDIA device, the
-power button is still the fallback. In that case the next boot's journal shows
-how far shutdown got.
+On 2026-09-23 the reboot was ordered at 17:47:12 and the machine was still
+frozen 10-20 minutes later, ending in a hard power-off anyway. It never reached
+the final shutdown stage; it crawled through per-unit kill ladders:
+
+```
+17:47:39  org.gnome.Shell@user.service: State 'final-watchdog' timed out. Killing.
+17:47:44  org.gnome.Shell@user.service: Processes still around after final SIGKILL.
+17:47:58  gnome-hang-monitor.service: State 'final-sigterm' timed out. Aborting.
+17:48:43  gnome-hang-monitor.service: State 'final-watchdog' timed out. Killing.
+17:48:58  user@1000.service: Processes still around after final SIGKILL.
+17:49:28  gnome-hang-monitor.service: Processes still around after final SIGKILL.
+17:49:28  Stopping systemd-logind.service...        ← last entry before power-off
+```
+
+Two causes, both of them ours, both now fixed:
+
+1. **The monitor's own diagnostics were part of the jam.** Nine `head`
+   processes reading `/sys/kernel/debug/dri/*/state` sat in `D`. That read takes
+   `drm_modeset_lock_all()` — the lock the wedge is holding — and once blocked it
+   cannot be killed, so each snapshot leaked one more. The monitor now skips
+   that read whenever the compositor has a thread inside the NVIDIA driver, and
+   keeps the harmless `clients` read. The unit also sets `TimeoutStopSec=10s`,
+   so a leftover child costs 10 s per stop rung rather than 45.
+2. **`reboot.target` allowed 30 minutes.** That is systemd's default
+   `JobTimeoutSec`, and `RebootWatchdogSec=5min` could not help because it only
+   arms in the `systemd-shutdown` stage this reboot never reached.
+   `usr/lib/systemd/system/reboot.target.d/10-fromelicks-bounded-reboot.conf`
+   cuts it to **180 s** with `JobTimeoutAction=reboot-force`. A healthy shutdown
+   here reaches reboot about 2 s after `graphical.target` stops, so the margin is
+   large. `poweroff.target` keeps the default; only the recovery path reboots.
+
+Worst case is now roughly: 90 s of failed probes, 60 s of wedge grace, then at
+most 180 s of shutdown before the force-reboot — about 5.5 minutes unattended,
+with the evidence preserved whenever shutdown gets far enough to flush it.
+
+**Still untested:** no one has yet watched the 180 s force-reboot fire. If even
+that fails, the power button remains the fallback, and the next boot's journal
+shows how far shutdown got.
 
 ## After the next occurrence
 
@@ -174,7 +246,12 @@ journalctl -b -1 -k --no-pager | grep -A60 -E 'sysrq: (Show Blocked State|Show b
 
 Look for a task other than gnome-shell with frames in `nvkms_*`, `nv_*`,
 `os_acquire_*` or `rm_*`. That is the lock holder, and it is what an upstream
-NVIDIA bug report needs.
+NVIDIA bug report needs. Check the **CPU backtraces** as well as the blocked
+tasks: on 2026-09-23 the holder was running, so it appeared only there.
+
+To confirm it is the same DIFR wedge, check whether the holder's stack contains
+`nvDIFRPrefetchSurfaces`. A different holder means a different bug, and the
+stack is worth keeping.
 
 To check the detection by hand against a live shell (root, because the symbol
 list is in the root-only runtime directory):
