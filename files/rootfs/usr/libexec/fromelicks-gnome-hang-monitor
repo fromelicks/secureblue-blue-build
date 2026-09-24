@@ -319,7 +319,7 @@ collect_thread_state() {
 }
 
 collect_drm_state() {
-  local card connector field
+  local card connector field pid="${1:-}" wedged=""
 
   echo "--- drm devices ---"
   ls -l /dev/dri /dev/dri/by-path 2>/dev/null || true
@@ -360,8 +360,31 @@ collect_drm_state() {
     echo "(nvidia-smi unavailable)"
   fi
 
-  echo "--- DRM debugfs clients and atomic state (bounded) ---"
-  for field in /sys/kernel/debug/dri/[0-9]*/clients /sys/kernel/debug/dri/[0-9]*/state; do
+  # Reading a DRM device's atomic "state" takes drm_modeset_lock_all(), which is
+  # exactly the lock a wedged modeset is holding. The read then blocks in D
+  # forever: timeout(1) cannot kill it, so every snapshot leaves another
+  # unkillable process behind. On 2026-09-23 nine of them accumulated, kept
+  # gnome-hang-monitor.service in its stop ladder ("Processes still around after
+  # final SIGKILL"), and helped stall the very reboot meant to end the wedge.
+  # The read has never once succeeded during a wedge. Skip it there and keep
+  # "clients", which only takes the file-list mutex.
+  if [ -n "$pid" ]; then
+    wedged=$(nvidia_wedged_threads "$(blocked_threads "$pid")")
+  fi
+
+  echo "--- DRM debugfs clients (bounded) ---"
+  for field in /sys/kernel/debug/dri/[0-9]*/clients; do
+    [ -r "$field" ] || continue
+    echo "[$field]"
+    timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
+  done
+
+  echo "--- DRM debugfs atomic state (bounded) ---"
+  if [ -n "$wedged" ]; then
+    echo "(skipped: $(join_lines "$wedged") holds the modeset lock this read would block on)"
+    return 0
+  fi
+  for field in /sys/kernel/debug/dri/[0-9]*/state; do
     [ -r "$field" ] || continue
     echo "[$field]"
     timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
@@ -592,7 +615,7 @@ collect_state() {
         2>/dev/null || true
     fi
 
-    collect_drm_state
+    collect_drm_state "$pid"
     if [ "$detail" = "full" ]; then
       collect_drm_clients
     fi

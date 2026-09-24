@@ -34,8 +34,12 @@ monitor records a snapshot under the `gnome-diagnostics` journal identifier:
   kernel stacks;
 - best-effort userspace backtraces from `eu-stack`;
 - user-session and inhibitor state;
-- DRM cards, connector state, runtime power state, and bounded `nvidia-smi`
-  output;
+- DRM cards, connector state, runtime power state, bounded `nvidia-smi`, and
+  the DRM debugfs `clients` list. The debugfs `state` file is **skipped while
+  the compositor is wedged inside the NVIDIA driver**: that read takes the
+  lock the wedge holds, blocks in `D` where nothing can kill it, and leaves a
+  process behind that later delays shutdown
+  (see [`nvidia-dpms-lock-hang.md`](nvidia-dpms-lock-hang.md));
 - every process holding a DRM device, including its SELinux domain and DRM
   client/engine/memory accounting from `/proc/*/fdinfo` (bounded to 20 seconds
   and 4000 processes);
