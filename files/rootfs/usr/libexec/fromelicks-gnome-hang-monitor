@@ -322,6 +322,16 @@ collect_thread_state() {
   fi
 }
 
+# Print each readable file matching the glob, truncated and time-bounded.
+dump_debugfs_bounded() {
+  local field
+  for field in "$@"; do
+    [ -r "$field" ] || continue
+    echo "[$field]"
+    timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
+  done
+}
+
 collect_drm_state() {
   local card connector field pid="${1:-}" wedged="" blocked_on_driver=""
 
@@ -334,10 +344,10 @@ collect_drm_state() {
   # be decided, treat it as unsafe and say so, rather than reading anyway.
   if [ -z "$pid" ]; then
     blocked_on_driver="no compositor PID passed, so a driver wedge cannot be ruled out"
-  elif ! load_nvidia_symbols; then
+  elif ! nvidia_symbols_available; then
     blocked_on_driver="$NVIDIA_SYMBOLS_FILE is missing, so a driver wedge cannot be ruled out"
   else
-    wedged=$(nvidia_wedged_threads "$(blocked_threads "$pid")")
+    wedged=$(wedged_threads "$pid")
     [ -n "$wedged" ] &&
       blocked_on_driver="$(join_lines "$wedged") waits on the modeset lock this read would block on"
   fi
@@ -385,11 +395,7 @@ collect_drm_state() {
 
   # "clients" only takes the file-list mutex, so it is safe during a wedge.
   echo "--- DRM debugfs clients (bounded) ---"
-  for field in /sys/kernel/debug/dri/[0-9]*/clients; do
-    [ -r "$field" ] || continue
-    echo "[$field]"
-    timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
-  done
+  dump_debugfs_bounded /sys/kernel/debug/dri/[0-9]*/clients
 
   # This read takes drm_modeset_lock_all(), the lock a wedged modeset holds,
   # and it has never once succeeded during a wedge.
@@ -397,11 +403,7 @@ collect_drm_state() {
   if [ -n "$blocked_on_driver" ]; then
     echo "(skipped: $blocked_on_driver)"
   else
-    for field in /sys/kernel/debug/dri/[0-9]*/state; do
-      [ -r "$field" ] || continue
-      echo "[$field]"
-      timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
-    done
+    dump_debugfs_bounded /sys/kernel/debug/dri/[0-9]*/state
   fi
 }
 
@@ -696,8 +698,6 @@ recover_shell() {
 # applies. Without the list, NVIDIA detection is off: a false match ends in a
 # reboot, while a miss only leaves today's behaviour.
 NVIDIA_SYMBOLS_FILE=$RUNDIR/nvidia-wchan-symbols
-declare -A NVIDIA_SYMBOLS=()
-NVIDIA_SYMBOLS_LOADED=no
 
 write_nvidia_symbols() {
   local tmp
@@ -711,20 +711,16 @@ write_nvidia_symbols() {
     mv -f "$tmp" "$NVIDIA_SYMBOLS_FILE" || { rm -f "$tmp"; return 1; }
 }
 
-load_nvidia_symbols() {
-  local symbol
-  [ "$NVIDIA_SYMBOLS_LOADED" = "no" ] || return 0
-  NVIDIA_SYMBOLS_LOADED=missing
-  [ -s "$NVIDIA_SYMBOLS_FILE" ] || return 1
-  while read -r symbol; do
-    NVIDIA_SYMBOLS[$symbol]=1
-  done < "$NVIDIA_SYMBOLS_FILE"
-  NVIDIA_SYMBOLS_LOADED=yes
-}
+nvidia_symbols_available() { [ -s "$NVIDIA_SYMBOLS_FILE" ]; }
 
+# Searched rather than loaded into an associative array: every detached
+# snapshot is a fresh process, and reading 27,761 names into bash costs far
+# more than the one grep per blocked thread this does -- while the machine is
+# already in trouble and this runs at nice +19.
 is_nvidia_wchan() {
-  load_nvidia_symbols || return 1
-  [ -n "$1" ] && [ -n "${NVIDIA_SYMBOLS[$1]:-}" ]
+  [ -n "$1" ] || return 1
+  nvidia_symbols_available || return 1
+  grep -qxF -- "$1" "$NVIDIA_SYMBOLS_FILE"
 }
 
 # Print "tid wchan comm" for every thread of $1 in uninterruptible sleep. One
@@ -737,6 +733,12 @@ blocked_threads() {
     printf '%s %s %s\n' "$tid" "${wchan:--}" "${comm:-unknown}"
   done < <(ps -L -p "$1" -o tid=,stat=,wchan:64=,comm= 2>/dev/null)
 }
+
+# The wedge test itself: the threads of $1 that are blocked inside the NVIDIA
+# driver. Empty output means no wedge. Every caller -- the reboot path, the
+# diagnostics and the "blocked" subcommand -- goes through this, so they cannot
+# drift apart on what a wedge is.
+wedged_threads() { nvidia_wedged_threads "$(blocked_threads "$1")"; }
 
 # Filter blocked_threads output ($1) down to threads inside the NVIDIA driver.
 nvidia_wedged_threads() {
@@ -822,7 +824,7 @@ dump_blocked_tasks() {
 still_wedged() {
   local uid="$1" pid="$2" wedged
   pid_is_gnome_shell_for_uid "$pid" "$uid" || return 1
-  wedged=$(nvidia_wedged_threads "$(blocked_threads "$pid")")
+  wedged=$(wedged_threads "$pid")
   [ -n "$wedged" ] || return 1
   printf '%s\n' "$wedged"
 }
@@ -912,8 +914,8 @@ monitor_loop() {
 
   mkdir -p "$RUNDIR"
   log_info "monitor: started (interval=${CHECK_INTERVAL_SECONDS}s timeout=${PROBE_TIMEOUT_SECONDS}s failures=${FAILURE_LIMIT} recovery=${RECOVER_HUNG_SHELL} snapshot_timeout=${SNAPSHOT_TIMEOUT_SECONDS}s wedge_action=${DRIVER_WEDGE_ACTION} wedge_kill_after=${DRIVER_WEDGE_KILL_AFTER_SECONDS}s wedge_grace=${DRIVER_WEDGE_GRACE_SECONDS}s)"
-  if load_nvidia_symbols; then
-    log_info "monitor: NVIDIA driver-wedge detection armed (${#NVIDIA_SYMBOLS[@]} symbols)"
+  if nvidia_symbols_available; then
+    log_info "monitor: NVIDIA driver-wedge detection armed ($(wc -l < "$NVIDIA_SYMBOLS_FILE") symbols)"
   else
     log_warn "monitor: $NVIDIA_SYMBOLS_FILE missing or empty; NVIDIA driver-wedge detection is off"
   fi
@@ -1094,7 +1096,7 @@ case "${1:-monitor}" in
       echo "no such process: $pid" >&2
       exit 2
     fi
-    if ! load_nvidia_symbols; then
+    if ! nvidia_symbols_available; then
       echo "NVIDIA symbol list $NVIDIA_SYMBOLS_FILE unavailable (run as root, with the service started)" >&2
       exit 2
     fi
