@@ -168,8 +168,9 @@ and SIGTERM still happen, but there is no SIGKILL escalation and no reboot.
 falls back to 60, the grace is clamped to at least 30 s, and the kill step is
 kept inside the grace. An unknown action is treated as `log`.
 
-Worst-case time from freeze to reboot is about 90 s of failed probes plus the
-60 s grace.
+Worst-case time from freeze to the reboot being *ordered* is about 90 s of
+failed probes, the 60 s grace, and up to 30 s for the `systemctl reboot` call
+itself. What happens after that is in "Bounding the reboot" below.
 
 ### Opting out
 
@@ -219,21 +220,58 @@ Two causes, both of them ours, both now fixed:
    that read whenever the compositor has a thread inside the NVIDIA driver, and
    keeps the harmless `clients` read. The unit also sets `TimeoutStopSec=10s`,
    so a leftover child costs 10 s per stop rung rather than 45.
-2. **`reboot.target` allowed 30 minutes.** That is systemd's default
-   `JobTimeoutSec`, and `RebootWatchdogSec=5min` could not help because it only
-   arms in the `systemd-shutdown` stage this reboot never reached.
-   `usr/lib/systemd/system/reboot.target.d/10-fromelicks-bounded-reboot.conf`
-   cuts it to **180 s** with `JobTimeoutAction=reboot-force`. A healthy shutdown
-   here reaches reboot about 2 s after `graphical.target` stops, so the margin is
-   large. `poweroff.target` keeps the default; only the recovery path reboots.
+2. **Nothing bounded the reboot itself.** `reboot.target` keeps systemd's
+   default `JobTimeoutSec` of 30 minutes, and `RebootWatchdogSec=5min` cannot
+   help, because it only arms in the `systemd-shutdown` stage that this reboot
+   never reached. See "Bounding the reboot".
 
-Worst case is now roughly: 90 s of failed probes, 60 s of wedge grace, then at
-most 180 s of shutdown before the force-reboot — about 5.5 minutes unattended,
-with the evidence preserved whenever shutdown gets far enough to flush it.
+### Bounding the reboot
 
-**Still untested:** no one has yet watched the 180 s force-reboot fire. If even
-that fails, the power button remains the fallback, and the next boot's journal
-shows how far shutdown got.
+The obvious fix — `JobTimeoutSec=180` with `JobTimeoutAction=reboot-force` in a
+`reboot.target.d/` drop-in — is **wrong here, and was reverted before it ever
+shipped.** That setting is machine-wide, and this image's update path reboots
+too: `ostree-finalize-staged.service` finalizes a staged deployment in its
+`ExecStop`, under a deliberate `TimeoutStopSec=5m` ("to handle cases with slow
+rotational media"). It conflicts with `final.target`, so that stop job runs
+inside the reboot job's window. A 180 s machine-wide bound can therefore cut a
+`bootc upgrade` short and lose the update.
+
+The bound is armed on the **recovery path only**. Before ordering the orderly
+reboot, the monitor runs
+
+```
+systemd-run --unit=fromelicks-wedge-force-reboot --on-active=180s \
+  --timer-property=DefaultDependencies=no --property=DefaultDependencies=no \
+  … force-reboot
+```
+
+`DefaultDependencies=no` on both transient units keeps them out of the shutdown
+transaction they exist to outlive, and being separate units puts them outside
+`gnome-hang-monitor.service`'s cgroup, so stopping the monitor does not take
+the backstop with it. When it fires, `force-reboot` waits while
+`ostree-finalize-staged.service` is still `deactivating` (up to
+`FINALIZE_WAIT_SECONDS`, 6 min) and only then runs `systemctl reboot --force`.
+
+Note what `--force` actually is: `systemd.unit(5)` describes the equivalent
+`reboot-force` as "a forced reboot which will terminate all processes forcibly
+but should cause **no dirty file systems** on reboot". Only `reboot -ff` /
+`reboot-immediate` calls `reboot(2)` directly. So this still enters
+`systemd-shutdown`, which kills, unmounts and syncs — and arms
+`RebootWatchdogSec=5min` as the last backstop.
+
+Timings, end to end: ~90 s of failed probes, 60 s of wedge grace, up to 30 s
+for the `systemctl reboot` call, then 180 s before the forced reboot, then up
+to 5 minutes of `systemd-shutdown` under the watchdog. So **about 6 minutes to
+the forced reboot and up to ~11 minutes absolute worst case**, against a wedge
+that previously needed the power button. Add up to 6 more minutes if a staged
+deployment is being finalized, which is the trade that keeps the update.
+
+**Still untested:** no one has yet watched the forced reboot fire on real
+hardware. The paths were exercised against a stubbed `systemctl`: finalize in
+progress then finishing, finalize never finishing (capped), nothing
+finalizing, and the forced reboot itself failing. If even that fails, the power
+button remains the fallback, and the next boot's journal shows how far shutdown
+got.
 
 ## After the next occurrence
 

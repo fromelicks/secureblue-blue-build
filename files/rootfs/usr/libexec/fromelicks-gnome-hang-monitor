@@ -32,6 +32,10 @@ RECOVERY_DISABLE_FILE=$RUNDIR/no-recovery
 DRIVER_WEDGE_ACTION=${DRIVER_WEDGE_ACTION:-reboot}
 DRIVER_WEDGE_GRACE_SECONDS=${DRIVER_WEDGE_GRACE_SECONDS:-60}
 DRIVER_WEDGE_KILL_AFTER_SECONDS=${DRIVER_WEDGE_KILL_AFTER_SECONDS:-15}
+FORCE_REBOOT_AFTER_SECONDS=${FORCE_REBOOT_AFTER_SECONDS:-180}
+FORCE_REBOOT_UNIT=fromelicks-wedge-force-reboot
+FINALIZE_UNIT=ostree-finalize-staged.service
+FINALIZE_WAIT_SECONDS=${FINALIZE_WAIT_SECONDS:-360}
 BLOCKED_TASKS_DUMP_UNIT=fromelicks-sysrq-show-blocked.service
 
 # These decide whether the machine reboots, so a drifted value must not quietly
@@ -319,7 +323,24 @@ collect_thread_state() {
 }
 
 collect_drm_state() {
-  local card connector field pid="${1:-}" wedged=""
+  local card connector field pid="${1:-}" wedged="" blocked_on_driver=""
+
+  # Both the nvidia-smi query below and the atomic "state" read enter the
+  # driver, and the whole premise of this section is that timeout(1) cannot
+  # kill a task that blocks in there: each attempt leaks a process that lives
+  # until the next boot. On 2026-09-23 nine of them kept this service in its
+  # stop ladder and helped stall the reboot meant to end the wedge. So decide
+  # once, up front, whether the driver is safe to touch -- and when that cannot
+  # be decided, treat it as unsafe and say so, rather than reading anyway.
+  if [ -z "$pid" ]; then
+    blocked_on_driver="no compositor PID passed, so a driver wedge cannot be ruled out"
+  elif ! load_nvidia_symbols; then
+    blocked_on_driver="$NVIDIA_SYMBOLS_FILE is missing, so a driver wedge cannot be ruled out"
+  else
+    wedged=$(nvidia_wedged_threads "$(blocked_threads "$pid")")
+    [ -n "$wedged" ] &&
+      blocked_on_driver="$(join_lines "$wedged") waits on the modeset lock this read would block on"
+  fi
 
   echo "--- drm devices ---"
   ls -l /dev/dri /dev/dri/by-path 2>/dev/null || true
@@ -352,7 +373,9 @@ collect_drm_state() {
   done
 
   echo "--- NVIDIA state (5s limit) ---"
-  if command -v nvidia-smi >/dev/null 2>&1; then
+  if [ -n "$blocked_on_driver" ]; then
+    echo "(skipped: $blocked_on_driver)"
+  elif command -v nvidia-smi >/dev/null 2>&1; then
     timeout -k 2s 5s nvidia-smi \
       --query-gpu=pci.bus_id,pstate,power.draw,memory.used,display_active,display_mode \
       --format=csv,noheader 2>&1 || echo "(nvidia-smi failed or timed out)"
@@ -360,18 +383,7 @@ collect_drm_state() {
     echo "(nvidia-smi unavailable)"
   fi
 
-  # Reading a DRM device's atomic "state" takes drm_modeset_lock_all(), which is
-  # exactly the lock a wedged modeset is holding. The read then blocks in D
-  # forever: timeout(1) cannot kill it, so every snapshot leaves another
-  # unkillable process behind. On 2026-09-23 nine of them accumulated, kept
-  # gnome-hang-monitor.service in its stop ladder ("Processes still around after
-  # final SIGKILL"), and helped stall the very reboot meant to end the wedge.
-  # The read has never once succeeded during a wedge. Skip it there and keep
-  # "clients", which only takes the file-list mutex.
-  if [ -n "$pid" ]; then
-    wedged=$(nvidia_wedged_threads "$(blocked_threads "$pid")")
-  fi
-
+  # "clients" only takes the file-list mutex, so it is safe during a wedge.
   echo "--- DRM debugfs clients (bounded) ---"
   for field in /sys/kernel/debug/dri/[0-9]*/clients; do
     [ -r "$field" ] || continue
@@ -379,16 +391,18 @@ collect_drm_state() {
     timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
   done
 
+  # This read takes drm_modeset_lock_all(), the lock a wedged modeset holds,
+  # and it has never once succeeded during a wedge.
   echo "--- DRM debugfs atomic state (bounded) ---"
-  if [ -n "$wedged" ]; then
-    echo "(skipped: $(join_lines "$wedged") holds the modeset lock this read would block on)"
-    return 0
+  if [ -n "$blocked_on_driver" ]; then
+    echo "(skipped: $blocked_on_driver)"
+  else
+    for field in /sys/kernel/debug/dri/[0-9]*/state; do
+      [ -r "$field" ] || continue
+      echo "[$field]"
+      timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
+    done
   fi
-  for field in /sys/kernel/debug/dri/[0-9]*/state; do
-    [ -r "$field" ] || continue
-    echo "[$field]"
-    timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
-  done
 }
 
 collect_drm_clients() {
@@ -747,6 +761,49 @@ join_lines() {
 # lock is usually not the compositor anyway. Synchronous, so the stacks are
 # taken before SIGTERM starts tearing the shell down. Once per compositor PID;
 # a failed attempt is retried on the next recovery cycle.
+# Arms the backstop for the orderly reboot below. DefaultDependencies=no keeps
+# both transient units out of the shutdown transaction they are meant to
+# outlive.
+arm_forced_reboot() {
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    log_err "monitor: systemd-run is unavailable; a stalled reboot will not be forced"
+    return 0
+  fi
+  if systemd-run --quiet --collect \
+       --unit="$FORCE_REBOOT_UNIT" \
+       --on-active="${FORCE_REBOOT_AFTER_SECONDS}s" \
+       --timer-property=AccuracySec=1s \
+       --timer-property=DefaultDependencies=no \
+       --property=DefaultDependencies=no \
+       --property=Type=oneshot \
+       "$SELF" force-reboot >/dev/null 2>&1; then
+    log_info "monitor: a forced reboot is armed for ${FORCE_REBOOT_AFTER_SECONDS}s from now if the orderly one stalls"
+  else
+    log_err "monitor: could not arm the forced reboot; a stalled reboot will need the power button"
+  fi
+}
+
+# Fired by that timer: the orderly reboot has not finished. A staged ostree
+# deployment is finalized by ostree-finalize-staged.service's ExecStop, which
+# is allowed 5 minutes of its own; interrupting it loses the update, so wait
+# that out first. Single --force, i.e. kill and unmount but no dirty
+# filesystems; once systemd-shutdown is reached, RebootWatchdogSec= takes over.
+force_reboot_now() {
+  local waited=0 held=no
+  while [ "$waited" -lt "$FINALIZE_WAIT_SECONDS" ]; do
+    [ "$(systemctl is-active "$FINALIZE_UNIT" 2>/dev/null)" = "deactivating" ] || break
+    if [ "$held" = no ]; then
+      log_info "monitor: $FINALIZE_UNIT is still finalizing a staged deployment; holding the forced reboot"
+      held=yes
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  log_err "monitor: the orderly reboot did not finish within ${FORCE_REBOOT_AFTER_SECONDS}s; forcing one"
+  systemctl reboot --force ||
+    log_err "monitor: the forced reboot failed; the machine needs the power button"
+}
+
 DUMPED_BLOCKED_PID=""
 
 dump_blocked_tasks() {
@@ -809,6 +866,17 @@ handle_driver_wedge() {
     log_err "monitor: gnome-shell PID $pid still blocked inside the NVIDIA driver after ${waited}s ($(join_lines "$wedged")); automatic reboot disabled; only a reboot will release the display"
     return 0
   fi
+
+  # The orderly reboot can itself stall: on 2026-09-23 it crawled through
+  # per-unit kill ladders for tasks stuck in D and had not finished 10-20
+  # minutes later. reboot.target's JobTimeoutSec= would bound it, but that
+  # setting is machine-wide, and cutting every reboot short is not safe here:
+  # ostree-finalize-staged.service finalizes a staged deployment in its
+  # ExecStop with a deliberate 5-minute timeout, and a forced reboot through
+  # that loses the update. So the bound is armed here instead, only on the
+  # recovery path, as a transient unit -- outside this service's cgroup, so
+  # stopping the monitor cannot take the backstop with it.
+  arm_forced_reboot
 
   # No explicit sync: sync(2) sleeps uninterruptibly on a stuck mount, and
   # timeout(1) waits for its child even after SIGKILL, so it could hold the
@@ -1037,6 +1105,10 @@ case "${1:-monitor}" in
     [ -z "$wedged" ] || exit 1
     exit 0
     ;;
+  force-reboot)
+    # Run by the transient timer that arm_forced_reboot sets up.
+    force_reboot_now
+    ;;
   nvidia-symbols)
     # Run by the unit's privileged ExecStartPre; see is_nvidia_wchan.
     write_nvidia_symbols
@@ -1049,7 +1121,7 @@ case "${1:-monitor}" in
     [ "${classification%% *}" != "starved" ]
     ;;
   *)
-    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|blocked PID|nvidia-symbols|classify|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]|starvation-snapshot LABEL [REASON] [LOOKBACK]}" >&2
+    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|blocked PID|nvidia-symbols|force-reboot|classify|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]|starvation-snapshot LABEL [REASON] [LOOKBACK]}" >&2
     exit 2
     ;;
 esac
