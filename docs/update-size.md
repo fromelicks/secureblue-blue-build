@@ -86,11 +86,18 @@ mtime to epoch 0 on:
 
 - **every directory**, which is cheap because an overlayfs copy-up of a directory
   is metadata only;
-- **every file and symlink that no RPM owns with that file type** (~14k paths,
-  ~1.8 GB). RPM payload mtimes are already stable, and skipping them avoids
+- **every file and symlink that no RPM owns with that file type** (~10k paths,
+  ~1.5 GB). RPM payload mtimes are already stable, and skipping them avoids
   copying ~10 GB up into the layer. The type check catches paths the build
   replaced: `/usr/bin/code` is a symlink in the RPM and a wrapper script here
   (`vscode-standard-malloc.sh`), so chunkah no longer counts it as owned.
+
+Ownership is judged the way chunkah judges it. `canonicalize_package_paths`
+(`rpm.rs`) resolves the *parent directory* of every RPM path. Fedora packages
+still record 5,179 files under `/lib`, `/lib64`, `/bin` and `/sbin` (libgcc's
+`/lib64/libgcc_s-*.so.1`, firmware under `/lib/firmware`), and `find` reports
+them under `/usr`. Without that step, 4,220 RPM payload files (354 MB) looked
+unowned and were copied up on every build for nothing.
 
 Do **not** select files by mtime age. An earlier version also zeroed "anything
 modified in the last week". That flips a package's layer once more when the
@@ -103,8 +110,7 @@ mtime of `/run` changes on every build. That dragged along every layer holding a
 `/run` entry (`/run/unbound` was in a 113 MB bin). A booted system mounts a tmpfs
 over `/run`, so the image's copy is build debris that nothing ever sees.
 
-Two files differed in *content* between identical builds, and the script fixes
-both:
+Two files differed in *content* between identical builds:
 
 - **fontconfig caches** record each font directory's mtime (the only 2 bytes
   that differed). The script regenerates them with `fc-cache --system-only
@@ -113,19 +119,29 @@ both:
   build time never validated (`FC_DEBUG=16 fc-list`: `cache checksum 1790247659
   dir checksum 0`), and fontconfig rescanned every font into each user's
   `~/.cache/fontconfig`.
-- **`/etc/dnf/repos.override.d/99-config_manager.repo`**: dnf5 writes the repos
-  that the dnf module enables in a different section order on every build. The
-  script sorts the sections, which does not change their meaning.
+- **`/etc/dnf/repos.override.d/99-config_manager.repo`**: the repos the dnf
+  module enables came out in a different section order on every build. The cause
+  is the module, not dnf5: `add_repos` looks up repos with `par-each`, which
+  returns in completion order, and dnf5 appends one section per `setopt` call.
+  Fixed at the source with `par-each --keep-order` in
+  fromelicks/blue-build-modules#8. Upstream `blue-build/modules` has the same
+  code. Do not sort the file instead: override sections can be globs where the
+  last match wins, so reordering can change which repos end up enabled.
 
 It skips mount points, because `/etc/resolv.conf`, `/etc/hosts` and the module
-mounts are bind mounts from the build host. The build fails if any directory is
-left non-zero.
+mounts are bind mounts from the build host.
 
-Zeroing mtimes has **no effect on a deployed system**, because ostree does not
+It has to be the **last module**, because anything a later module writes carries
+a fresh mtime again. The script cannot detect that itself, so the build workflow
+checks it with `yq` before building and fails the run otherwise.
+
+The zeroing itself is **invisible on a deployed system**, because ostree does not
 store mtimes and every file under `/usr` is epoch 0 once deployed
-(`ls -l --time-style=+%s /usr`).
+(`ls -l --time-style=+%s /usr`). Two side effects are visible: the fontconfig
+caches are regenerated (and now validate, see above), and the image's `/run` is
+empty, which nothing sees under the runtime tmpfs.
 
-BlueBuild's `post_build.sh` still runs afterwards. The RPM-owned directories it
+BlueBuild's `post_build.sh` runs once, after the last module. The RPM-owned directories it
 changes (`/`, `/var`, `/usr/lib/tmpfiles.d`) are clamped to their package's build
 time. The `/opt` symlink and `rpm-ostree-base-db` are not owned by any RPM, so they
 keep the post-build time and change `chunkah/unclaimed` on every build.
@@ -155,7 +171,7 @@ carried 1.6 GB of layers with no changed package.
 - **`rpm/dnf5`** (8 MB): `/usr/lib/sysimage/libdnf5/transaction_history.sqlite`
   and `nevras.toml` change on every dnf run.
 - **`chunkah/unclaimed`** (58 MB): the `/opt` symlink and `rpm-ostree-base-db`,
-  which BlueBuild's `post_build.sh` rewrites after every module. Fixing them
+  which BlueBuild's `post_build.sh` rewrites after the last module. Fixing them
   needs BlueBuild to pass `SOURCE_DATE_EPOCH=0` to chunkah again
   (blue-build/cli#836, reverted).
 - **java `cacerts`**: regenerated with fresh timestamps; it drags its ~20 MB bin

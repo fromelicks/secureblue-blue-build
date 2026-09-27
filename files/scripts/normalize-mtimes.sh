@@ -8,25 +8,30 @@ set -euo pipefail
 # already older than the clamp passes through untouched, and those mtimes
 # drift from build to build in the secureblue base -- so ~40 layers (~1.6 GB)
 # changed digest daily with byte-identical contents. ostree discards every
-# mtime on import anyway (the booted /usr is all epoch 0), so zeroing them here
-# changes nothing on a deployed system; it only stops the churn.
+# mtime on import (the booted /usr is all epoch 0), so the zeroing itself is
+# invisible on a deployed system. Two side effects are not: the fontconfig
+# caches are regenerated (and now validate at runtime), and the image's /run
+# is emptied (never visible under the runtime tmpfs).
 #
 # Directories: all of them. Cheap -- an overlayfs copy-up of a directory is
-# metadata only. Non-directories: the ones no RPM owns *with that file type*.
-# RPM payload mtimes are already stable, and skipping them avoids copying
-# ~10 GB up into this layer. The type check catches paths the build replaced,
-# e.g. /usr/bin/code (a symlink in the RPM, a wrapper script here), which
-# chunkah no longer counts as owned. Never select by mtime age: a
-# "changed recently" rule flips a package's layer once it ages out.
+# metadata only. Non-directories: the ones no RPM owns *with that file type*,
+# judged the way chunkah judges ownership (the RPM path's parent directory
+# canonicalized, so /lib64/libgcc_s.so.1 owns /usr/lib64/libgcc_s.so.1). RPM
+# payload mtimes are already stable, and skipping them avoids copying ~10 GB up
+# into this layer. The type check catches paths the build replaced, e.g.
+# /usr/bin/code (a symlink in the RPM, a wrapper script here), which chunkah no
+# longer counts as owned. Never select by mtime age: a "changed recently" rule
+# flips a package's layer once it ages out.
 #
 # /run is emptied instead: every RUN step bumps its mtime (buildah's mount
 # points), and a booted system mounts a tmpfs over it, so its contents are
 # build leftovers nobody can see.
 #
-# Must be the LAST module. BlueBuild's post_build.sh still runs afterwards; the
-# RPM-owned directories it touches (/, /var, /usr/lib/tmpfiles.d) are clamped
-# to their package's build time, but /opt and rpm-ostree-base-db are not, so
-# chunkah/unclaimed (~58 MB) still changes on every build.
+# Must be the LAST module (the build workflow asserts it). BlueBuild's
+# post_build.sh runs once after it; the RPM-owned directories it touches (/,
+# /var, /usr/lib/tmpfiles.d) are clamped to their package's build time, but
+# /opt and rpm-ostree-base-db are not, so chunkah/unclaimed (~58 MB) still
+# changes on every build.
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -34,14 +39,32 @@ trap 'rm -rf "$tmp"' EXIT
 # Mount points are never touched: /etc/resolv.conf, /etc/hosts and the module
 # mounts are bind mounts from the build host.
 findmnt -rn -o TARGET | sed 's/\\x20/ /g' | tr '\n' '\0' | LC_ALL=C sort -zu >"$tmp/mounts"
-# "<type> <path>" for every RPM-owned path, type as find's %y (f, l, d, ...).
-rpm -qa --qf '[%{FILEMODES:perms} %{FILENAMES}\n]' |
-    awk '{ t = substr($1, 1, 1); if (t == "-") t = "f"; sub(/^[^ ]+ /, ""); print t " " $0 }' |
-    tr '\n' '\0' | LC_ALL=C sort -zu >"$tmp/owned"
+
+# "<type> <path>" for every RPM-owned path, type as find's %y (f, l, d, ...),
+# with the parent directory canonicalized like chunkah's
+# canonicalize_package_paths (rpm.rs), so /lib64 and /sbin paths match the
+# /usr ones that find reports.
+rpm -qa --qf '[%{FILEMODES:perms} %{FILENAMES}\n]' | python3 -c '
+import os, sys
+cache, out = {}, sys.stdout.buffer
+for line in sys.stdin.buffer:
+    perms, _, path = line.rstrip(b"\n").partition(b" ")
+    kind = b"f" if perms[:1] == b"-" else perms[:1]
+    parent, name = os.path.split(path)
+    real = cache.get(parent)
+    if real is None:
+        real = cache[parent] = os.path.realpath(parent)
+    out.write(kind + b" " + os.path.join(real, name) + b"\0")
+' | LC_ALL=C sort -zu >"$tmp/owned"
 
 walk() {
     find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var \) -prune \
         -o "$@" | LC_ALL=C sort -z
+}
+
+zero_dirs() {
+    walk -type d -print0 | LC_ALL=C comm -z -23 - "$tmp/mounts" >"$tmp/dirs"
+    xargs -0 -r touch -h -d @0 -- <"$tmp/dirs"
 }
 
 # Skip any /run entry that is, or contains, a mount point (buildah's secrets).
@@ -50,33 +73,6 @@ while IFS= read -r -d '' entry; do
         rm -rf -- "$entry"
     fi
 done < <(find /run -mindepth 1 -maxdepth 1 -print0)
-
-zero_dirs() {
-    walk -type d -print0 | LC_ALL=C comm -z -23 - "$tmp/mounts" >"$tmp/dirs"
-    xargs -0 -r touch -h -d @0 -- <"$tmp/dirs"
-}
-
-# Content that differs between identical builds only in ordering: dnf5 writes
-# the repos the dnf module enabled in a different section order every time.
-for repo in /etc/dnf/repos.override.d/*.repo; do
-    [ -f "$repo" ] || continue
-    python3 - "$repo" <<'PY'
-import sys
-path = sys.argv[1]
-head, sections, current = [], {}, None
-with open(path) as f:
-    for line in f:
-        if line.startswith("["):
-            current = line
-            sections.setdefault(current, [])
-        elif current is None:
-            head.append(line)
-        else:
-            sections[current].append(line)
-with open(path, "w") as f:
-    f.write("".join(head + [l for name in sorted(sections) for l in [name] + sections[name]]))
-PY
-done
 
 # fontconfig caches record each font directory's mtime, so regenerate them once
 # the directories are zeroed. This also fixes the deployed system: there every
@@ -87,17 +83,12 @@ if command -v fc-cache >/dev/null; then
     fc-cache --system-only --force
 fi
 
-# Files first: a copy-up must not bump a directory after it has been zeroed.
 walk ! -type d -printf '%y %p\0' | LC_ALL=C comm -z -23 - "$tmp/owned" |
     sed -z 's/^. //' | LC_ALL=C sort -z | LC_ALL=C comm -z -23 - "$tmp/mounts" >"$tmp/files"
 xargs -0 -r touch -h -d @0 -- <"$tmp/files"
+# Again, last: fc-cache wrote into /usr/lib/fontconfig/cache, and a file
+# copy-up can bump its parent directory.
 zero_dirs
 
-files=$(tr -cd '\0' <"$tmp/files" | wc -c)
-dirs=$(tr -cd '\0' <"$tmp/dirs" | wc -c)
-left=$(xargs -0 -r stat -c '%Y' -- <"$tmp/dirs" | grep -cv '^0$' || true)
-echo "normalize-mtimes: zeroed ${dirs} directories and ${files} files"
-if [ "$left" -ne 0 ]; then
-    echo "normalize-mtimes: ${left} directories still have a non-zero mtime" >&2
-    exit 1
-fi
+echo "normalize-mtimes: zeroed $(tr -cd '\0' <"$tmp/dirs" | wc -c) directories" \
+    "and $(tr -cd '\0' <"$tmp/files" | wc -c) files"

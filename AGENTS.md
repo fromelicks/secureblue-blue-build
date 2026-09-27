@@ -192,7 +192,8 @@ These gate multiple features. Verified against secureblue source.
     the image's creation time) but never raises them, so an old but drifting mtime
     passes through. Before the fix, ~40 layers (~1.6 GB) changed every day with
     identical contents. `normalize-mtimes.sh` must stay the **last** recipe module:
-    anything a later module writes carries a fresh mtime again. Preview any update
+    anything a later module writes carries a fresh mtime again (the build workflow
+    fails if it is not). Preview any update
     with `ujust update-diff`. See [`docs/update-size.md`](docs/update-size.md).
 
 ## Feature implementation plan
