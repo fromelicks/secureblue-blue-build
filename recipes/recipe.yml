@@ -157,3 +157,11 @@ modules:
 
   - type: signing # this sets up the proper policy & signing files for signed images to work fully
     source: ghcr.io/fromelicks/modules:pr-4
+
+  # MUST stay the last module. Zeroes the mtimes that made ~40 chunkah layers
+  # (~1.6 GB) change digest every day with identical contents. ostree drops
+  # mtimes on import, so this has no effect on a deployed system.
+  # See docs/update-size.md.
+  - type: script
+    scripts:
+      - normalize-mtimes.sh

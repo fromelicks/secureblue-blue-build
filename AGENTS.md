@@ -186,6 +186,15 @@ These gate multiple features. Verified against secureblue source.
     launches normally. Hit by Claude Desktop; see
     [`docs/claude-desktop.md`](docs/claude-desktop.md).
 
+16. **A layer's digest must change only when its contents do.** chunkah layers the
+    image by component, and bootc downloads every layer whose digest is new. chunkah
+    *clamps* mtimes (RPM-owned paths to the package's build time, everything else to
+    the image's creation time) but never raises them, so an old but drifting mtime
+    passes through. Before the fix, ~40 layers (~1.6 GB) changed every day with
+    identical contents. `normalize-mtimes.sh` must stay the **last** recipe module:
+    anything a later module writes carries a fresh mtime again. Preview any update
+    with `ujust update-diff`. See [`docs/update-size.md`](docs/update-size.md).
+
 ## Feature implementation plan
 
 | Feature | Where | How | Notes / gotchas |
