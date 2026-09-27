@@ -86,12 +86,22 @@ mtime to epoch 0 on:
 
 - **every directory**, which is cheap because an overlayfs copy-up of a directory
   is metadata only;
-- **every file and symlink that no RPM owns** (~14k paths, ~1.8 GB), plus
-  **anything modified in the last week**. RPM-owned files keep their payload
-  mtimes, which are already stable, and skipping them avoids copying ~10 GB up
-  into the layer. The one-week window catches RPM paths whose type the build
-  changed: `/usr/bin/code` is a symlink in the RPM and a wrapper script here
+- **every file and symlink that no RPM owns with that file type** (~14k paths,
+  ~1.8 GB). RPM payload mtimes are already stable, and skipping them avoids
+  copying ~10 GB up into the layer. The type check catches paths the build
+  replaced: `/usr/bin/code` is a symlink in the RPM and a wrapper script here
   (`vscode-standard-malloc.sh`), so chunkah no longer counts it as owned.
+
+Do **not** select files by mtime age. An earlier version also zeroed "anything
+modified in the last week". That flips a package's layer once more when the
+package ages out of the window: 28 layers (2.6 GB) differed between builds of
+the two versions.
+
+It **empties `/run`** instead of zeroing it. buildah creates and removes mount
+points there on every `RUN` step, including BlueBuild's post-build step, so the
+mtime of `/run` changes on every build. That dragged along every layer holding a
+`/run` entry (`/run/unbound` was in a 113 MB bin). A booted system mounts a tmpfs
+over `/run`, so the image's copy is build debris that nothing ever sees.
 
 Two files differed in *content* between identical builds, and the script fixes
 both:
@@ -122,20 +132,17 @@ keep the post-build time and change `chunkah/unclaimed` on every build.
 
 ## Result
 
-Two CI builds of the first version of the fix (commit `98a0804`, the push and
-`pull_request` runs of PR #54), both on the same secureblue base, differed in
-**4 of 128 layers, 223 MB**:
+Each round compares two CI builds of the same commit (the branch push and
+`pull_request` runs of PR #54) on the same secureblue base:
 
-| Layer | Size | Cause | Now |
-|---|---|---|---|
-| `bigfiles/rpmdb.sqlite` | 44 MB | install times | unavoidable |
-| `rpm/dnf5` | 8 MB | libdnf5 transaction history | unavoidable |
-| `chunkah/unclaimed` | 58 MB | fontconfig caches, repo order, `/run/*`, `/usr/bin/code`, post-build `/opt` | only `/opt` and `rpm-ostree-base-db` remain |
-| bigfiles bin with the big fontconfig cache | 113 MB | `/run` directory mtime | fixed |
+| Commit | Differing layers | Cause |
+|---|---|---|
+| `98a0804` (dirs + unowned files) | 4 of 128, 223 MB | rpmdb, `rpm/dnf5`, `chunkah/unclaimed` (fontconfig caches, repo order, `/run/*`, `/usr/bin/code`, post-build `/opt`), a 113 MB bin (`/run` mtime) |
+| `801cc18` (+ fontconfig, repo order, 1-week rule) | 4 of 128, 223 MB | the content differences are gone; the mtimes of `/run`, `/opt` and `rpm-ostree-base-db` from the post-build step remain |
 
-The floor for a rebuild with no package changes should therefore be about
-110 MB (rpmdb, dnf5, unclaimed). For comparison, the 2026-09-25 update carried
-1.6 GB of layers with no changed package.
+The floor for a rebuild with no package changes should be about 110 MB
+(rpmdb, `rpm/dnf5`, `chunkah/unclaimed`). For comparison, the 2026-09-25 update
+carried 1.6 GB of layers with no changed package.
 
 ## Churn that remains
 

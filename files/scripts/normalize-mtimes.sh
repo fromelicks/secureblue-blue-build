@@ -12,11 +12,16 @@ set -euo pipefail
 # changes nothing on a deployed system; it only stops the churn.
 #
 # Directories: all of them. Cheap -- an overlayfs copy-up of a directory is
-# metadata only. Non-directories: the ones no RPM owns, plus anything modified
-# in the last week. RPM payload mtimes are already stable, and skipping them
-# avoids copying ~10 GB up into this layer. The one-week window catches RPM
-# paths whose type the build changed (e.g. /usr/bin/code, a symlink in the RPM
-# and a wrapper script here), which chunkah no longer counts as owned.
+# metadata only. Non-directories: the ones no RPM owns *with that file type*.
+# RPM payload mtimes are already stable, and skipping them avoids copying
+# ~10 GB up into this layer. The type check catches paths the build replaced,
+# e.g. /usr/bin/code (a symlink in the RPM, a wrapper script here), which
+# chunkah no longer counts as owned. Never select by mtime age: a
+# "changed recently" rule flips a package's layer once it ages out.
+#
+# /run is emptied instead: every RUN step bumps its mtime (buildah's mount
+# points), and a booted system mounts a tmpfs over it, so its contents are
+# build leftovers nobody can see.
 #
 # Must be the LAST module. BlueBuild's post_build.sh still runs afterwards; the
 # RPM-owned directories it touches (/, /var, /usr/lib/tmpfiles.d) are clamped
@@ -29,15 +34,25 @@ trap 'rm -rf "$tmp"' EXIT
 # Mount points are never touched: /etc/resolv.conf, /etc/hosts and the module
 # mounts are bind mounts from the build host.
 findmnt -rn -o TARGET | sed 's/\\x20/ /g' | tr '\n' '\0' | LC_ALL=C sort -zu >"$tmp/mounts"
-{ rpm -qa --qf '[%{FILENAMES}\n]' | tr '\n' '\0'; cat "$tmp/mounts"; } | LC_ALL=C sort -zu >"$tmp/keep"
+# "<type> <path>" for every RPM-owned path, type as find's %y (f, l, d, ...).
+rpm -qa --qf '[%{FILEMODES:perms} %{FILENAMES}\n]' |
+    awk '{ t = substr($1, 1, 1); if (t == "-") t = "f"; sub(/^[^ ]+ /, ""); print t " " $0 }' |
+    tr '\n' '\0' | LC_ALL=C sort -zu >"$tmp/owned"
 
 walk() {
     find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var \) -prune \
-        -o "$@" -print0 | LC_ALL=C sort -z
+        -o "$@" | LC_ALL=C sort -z
 }
 
+# Skip any /run entry that is, or contains, a mount point (buildah's secrets).
+while IFS= read -r -d '' entry; do
+    if ! tr '\0' '\n' <"$tmp/mounts" | grep -qxF -e "$entry" && ! tr '\0' '\n' <"$tmp/mounts" | grep -qF -e "$entry/"; then
+        rm -rf -- "$entry"
+    fi
+done < <(find /run -mindepth 1 -maxdepth 1 -print0)
+
 zero_dirs() {
-    walk -type d | LC_ALL=C comm -z -23 - "$tmp/mounts" >"$tmp/dirs"
+    walk -type d -print0 | LC_ALL=C comm -z -23 - "$tmp/mounts" >"$tmp/dirs"
     xargs -0 -r touch -h -d @0 -- <"$tmp/dirs"
 }
 
@@ -73,10 +88,8 @@ if command -v fc-cache >/dev/null; then
 fi
 
 # Files first: a copy-up must not bump a directory after it has been zeroed.
-{
-    walk ! -type d | LC_ALL=C comm -z -23 - "$tmp/keep"
-    walk ! -type d -mtime -7 | LC_ALL=C comm -z -23 - "$tmp/mounts"
-} | LC_ALL=C sort -zu >"$tmp/files"
+walk ! -type d -printf '%y %p\0' | LC_ALL=C comm -z -23 - "$tmp/owned" |
+    sed -z 's/^. //' | LC_ALL=C sort -z | LC_ALL=C comm -z -23 - "$tmp/mounts" >"$tmp/files"
 xargs -0 -r touch -h -d @0 -- <"$tmp/files"
 zero_dirs
 
