@@ -139,9 +139,9 @@ Each round compares two CI builds of the same commit (the branch push and
 |---|---|---|
 | `98a0804` (dirs + unowned files) | 4 of 128, 223 MB | rpmdb, `rpm/dnf5`, `chunkah/unclaimed` (fontconfig caches, repo order, `/run/*`, `/usr/bin/code`, post-build `/opt`), a 113 MB bin (`/run` mtime) |
 | `801cc18` (+ fontconfig, repo order, 1-week rule) | 4 of 128, 223 MB | the content differences are gone; the mtimes of `/run`, `/opt` and `rpm-ostree-base-db` from the post-build step remain |
+| `aa6b214` (+ empty `/run`, type-aware ownership) | **3 of 128, 110 MB** | rpmdb, `rpm/dnf5`, and `chunkah/unclaimed`, where only the post-build mtimes of `/opt`, `/run`, `usr/lib/sysimage/cache` and `rpm-ostree-base-db` differ |
 
-The floor for a rebuild with no package changes should be about 110 MB
-(rpmdb, `rpm/dnf5`, `chunkah/unclaimed`). For comparison, the 2026-09-25 update
+So a rebuild with no package changes costs about 110 MB. For comparison, the 2026-09-25 update
 carried 1.6 GB of layers with no changed package.
 
 ## Churn that remains
