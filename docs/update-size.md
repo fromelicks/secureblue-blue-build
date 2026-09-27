@@ -86,21 +86,56 @@ mtime to epoch 0 on:
 
 - **every directory**, which is cheap because an overlayfs copy-up of a directory
   is metadata only;
-- **every file and symlink that no RPM owns** (~14k paths, ~1.8 GB). RPM-owned
-  files keep their payload mtimes, which are already stable, and skipping them
-  avoids copying ~10 GB up into the layer.
+- **every file and symlink that no RPM owns** (~14k paths, ~1.8 GB), plus
+  **anything modified in the last week**. RPM-owned files keep their payload
+  mtimes, which are already stable, and skipping them avoids copying ~10 GB up
+  into the layer. The one-week window catches RPM paths whose type the build
+  changed: `/usr/bin/code` is a symlink in the RPM and a wrapper script here
+  (`vscode-standard-malloc.sh`), so chunkah no longer counts it as owned.
 
-It skips mount points: `/etc/resolv.conf`, `/etc/hosts` and the module mounts
-are bind mounts from the build host. The build fails if any directory is left
-non-zero.
+Two files differed in *content* between identical builds, and the script fixes
+both:
+
+- **fontconfig caches** record each font directory's mtime (the only 2 bytes
+  that differed). The script regenerates them with `fc-cache --system-only
+  --force` after zeroing the directories. This also fixes a runtime problem: on
+  a deployed system every directory is mtime 0, so caches that recorded the
+  build time never validated (`FC_DEBUG=16 fc-list`: `cache checksum 1790247659
+  dir checksum 0`), and fontconfig rescanned every font into each user's
+  `~/.cache/fontconfig`.
+- **`/etc/dnf/repos.override.d/99-config_manager.repo`**: dnf5 writes the repos
+  that the dnf module enables in a different section order on every build. The
+  script sorts the sections, which does not change their meaning.
+
+It skips mount points, because `/etc/resolv.conf`, `/etc/hosts` and the module
+mounts are bind mounts from the build host. The build fails if any directory is
+left non-zero.
 
 Zeroing mtimes has **no effect on a deployed system**, because ostree does not
 store mtimes and every file under `/usr` is epoch 0 once deployed
 (`ls -l --time-style=+%s /usr`).
 
-BlueBuild's `post_build.sh` still runs afterwards. It changes `/`, `/var`,
-`/usr/lib/tmpfiles.d` and the rpmdb directories, all RPM-owned, so chunkah clamps
-them to the owning package's build time, which is stable.
+BlueBuild's `post_build.sh` still runs afterwards. The RPM-owned directories it
+changes (`/`, `/var`, `/usr/lib/tmpfiles.d`) are clamped to their package's build
+time. The `/opt` symlink and `rpm-ostree-base-db` are not owned by any RPM, so they
+keep the post-build time and change `chunkah/unclaimed` on every build.
+
+## Result
+
+Two CI builds of the first version of the fix (commit `98a0804`, the push and
+`pull_request` runs of PR #54), both on the same secureblue base, differed in
+**4 of 128 layers, 223 MB**:
+
+| Layer | Size | Cause | Now |
+|---|---|---|---|
+| `bigfiles/rpmdb.sqlite` | 44 MB | install times | unavoidable |
+| `rpm/dnf5` | 8 MB | libdnf5 transaction history | unavoidable |
+| `chunkah/unclaimed` | 58 MB | fontconfig caches, repo order, `/run/*`, `/usr/bin/code`, post-build `/opt` | only `/opt` and `rpm-ostree-base-db` remain |
+| bigfiles bin with the big fontconfig cache | 113 MB | `/run` directory mtime | fixed |
+
+The floor for a rebuild with no package changes should therefore be about
+110 MB (rpmdb, dnf5, unclaimed). For comparison, the 2026-09-25 update carried
+1.6 GB of layers with no changed package.
 
 ## Churn that remains
 
@@ -112,6 +147,10 @@ them to the owning package's build time, which is stable.
   that (secureblue force-loads nvidia early).
 - **`rpm/dnf5`** (8 MB): `/usr/lib/sysimage/libdnf5/transaction_history.sqlite`
   and `nevras.toml` change on every dnf run.
+- **`chunkah/unclaimed`** (58 MB): the `/opt` symlink and `rpm-ostree-base-db`,
+  which BlueBuild's `post_build.sh` rewrites after every module. Fixing them
+  needs BlueBuild to pass `SOURCE_DATE_EPOCH=0` to chunkah again
+  (blue-build/cli#836, reverted).
 - **java `cacerts`**: regenerated with fresh timestamps; it drags its ~20 MB bin
   along.
 - **Hardlink-vs-file flips** in license files: the base image's inode sharing
