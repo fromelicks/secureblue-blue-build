@@ -32,6 +32,10 @@ RECOVERY_DISABLE_FILE=$RUNDIR/no-recovery
 DRIVER_WEDGE_ACTION=${DRIVER_WEDGE_ACTION:-reboot}
 DRIVER_WEDGE_GRACE_SECONDS=${DRIVER_WEDGE_GRACE_SECONDS:-60}
 DRIVER_WEDGE_KILL_AFTER_SECONDS=${DRIVER_WEDGE_KILL_AFTER_SECONDS:-15}
+FORCE_REBOOT_AFTER_SECONDS=${FORCE_REBOOT_AFTER_SECONDS:-180}
+FORCE_REBOOT_UNIT=fromelicks-wedge-force-reboot
+FINALIZE_UNIT=ostree-finalize-staged.service
+FINALIZE_WAIT_SECONDS=${FINALIZE_WAIT_SECONDS:-360}
 BLOCKED_TASKS_DUMP_UNIT=fromelicks-sysrq-show-blocked.service
 
 # These decide whether the machine reboots, so a drifted value must not quietly
@@ -318,8 +322,35 @@ collect_thread_state() {
   fi
 }
 
+# Print each readable file matching the glob, truncated and time-bounded.
+dump_debugfs_bounded() {
+  local field
+  for field in "$@"; do
+    [ -r "$field" ] || continue
+    echo "[$field]"
+    timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
+  done
+}
+
 collect_drm_state() {
-  local card connector field
+  local card connector field pid="${1:-}" wedged="" blocked_on_driver=""
+
+  # Both the nvidia-smi query below and the atomic "state" read enter the
+  # driver, and the whole premise of this section is that timeout(1) cannot
+  # kill a task that blocks in there: each attempt leaks a process that lives
+  # until the next boot. On 2026-09-23 nine of them kept this service in its
+  # stop ladder and helped stall the reboot meant to end the wedge. So decide
+  # once, up front, whether the driver is safe to touch -- and when that cannot
+  # be decided, treat it as unsafe and say so, rather than reading anyway.
+  if [ -z "$pid" ]; then
+    blocked_on_driver="no compositor PID passed, so a driver wedge cannot be ruled out"
+  elif ! nvidia_symbols_available; then
+    blocked_on_driver="$NVIDIA_SYMBOLS_FILE is missing, so a driver wedge cannot be ruled out"
+  else
+    wedged=$(wedged_threads "$pid")
+    [ -n "$wedged" ] &&
+      blocked_on_driver="$(join_lines "$wedged") waits on the modeset lock this read would block on"
+  fi
 
   echo "--- drm devices ---"
   ls -l /dev/dri /dev/dri/by-path 2>/dev/null || true
@@ -352,7 +383,9 @@ collect_drm_state() {
   done
 
   echo "--- NVIDIA state (5s limit) ---"
-  if command -v nvidia-smi >/dev/null 2>&1; then
+  if [ -n "$blocked_on_driver" ]; then
+    echo "(skipped: $blocked_on_driver)"
+  elif command -v nvidia-smi >/dev/null 2>&1; then
     timeout -k 2s 5s nvidia-smi \
       --query-gpu=pci.bus_id,pstate,power.draw,memory.used,display_active,display_mode \
       --format=csv,noheader 2>&1 || echo "(nvidia-smi failed or timed out)"
@@ -360,12 +393,18 @@ collect_drm_state() {
     echo "(nvidia-smi unavailable)"
   fi
 
-  echo "--- DRM debugfs clients and atomic state (bounded) ---"
-  for field in /sys/kernel/debug/dri/[0-9]*/clients /sys/kernel/debug/dri/[0-9]*/state; do
-    [ -r "$field" ] || continue
-    echo "[$field]"
-    timeout -k 1s 3s head -n 1000 "$field" 2>&1 || echo "(read failed or timed out)"
-  done
+  # "clients" only takes the file-list mutex, so it is safe during a wedge.
+  echo "--- DRM debugfs clients (bounded) ---"
+  dump_debugfs_bounded /sys/kernel/debug/dri/[0-9]*/clients
+
+  # This read takes drm_modeset_lock_all(), the lock a wedged modeset holds,
+  # and it has never once succeeded during a wedge.
+  echo "--- DRM debugfs atomic state (bounded) ---"
+  if [ -n "$blocked_on_driver" ]; then
+    echo "(skipped: $blocked_on_driver)"
+  else
+    dump_debugfs_bounded /sys/kernel/debug/dri/[0-9]*/state
+  fi
 }
 
 collect_drm_clients() {
@@ -592,7 +631,7 @@ collect_state() {
         2>/dev/null || true
     fi
 
-    collect_drm_state
+    collect_drm_state "$pid"
     if [ "$detail" = "full" ]; then
       collect_drm_clients
     fi
@@ -659,8 +698,6 @@ recover_shell() {
 # applies. Without the list, NVIDIA detection is off: a false match ends in a
 # reboot, while a miss only leaves today's behaviour.
 NVIDIA_SYMBOLS_FILE=$RUNDIR/nvidia-wchan-symbols
-declare -A NVIDIA_SYMBOLS=()
-NVIDIA_SYMBOLS_LOADED=no
 
 write_nvidia_symbols() {
   local tmp
@@ -674,20 +711,16 @@ write_nvidia_symbols() {
     mv -f "$tmp" "$NVIDIA_SYMBOLS_FILE" || { rm -f "$tmp"; return 1; }
 }
 
-load_nvidia_symbols() {
-  local symbol
-  [ "$NVIDIA_SYMBOLS_LOADED" = "no" ] || return 0
-  NVIDIA_SYMBOLS_LOADED=missing
-  [ -s "$NVIDIA_SYMBOLS_FILE" ] || return 1
-  while read -r symbol; do
-    NVIDIA_SYMBOLS[$symbol]=1
-  done < "$NVIDIA_SYMBOLS_FILE"
-  NVIDIA_SYMBOLS_LOADED=yes
-}
+nvidia_symbols_available() { [ -s "$NVIDIA_SYMBOLS_FILE" ]; }
 
+# Searched rather than loaded into an associative array: every detached
+# snapshot is a fresh process, and reading 27,761 names into bash costs far
+# more than the one grep per blocked thread this does -- while the machine is
+# already in trouble and this runs at nice +19.
 is_nvidia_wchan() {
-  load_nvidia_symbols || return 1
-  [ -n "$1" ] && [ -n "${NVIDIA_SYMBOLS[$1]:-}" ]
+  [ -n "$1" ] || return 1
+  nvidia_symbols_available || return 1
+  grep -qxF -- "$1" "$NVIDIA_SYMBOLS_FILE"
 }
 
 # Print "tid wchan comm" for every thread of $1 in uninterruptible sleep. One
@@ -700,6 +733,12 @@ blocked_threads() {
     printf '%s %s %s\n' "$tid" "${wchan:--}" "${comm:-unknown}"
   done < <(ps -L -p "$1" -o tid=,stat=,wchan:64=,comm= 2>/dev/null)
 }
+
+# The wedge test itself: the threads of $1 that are blocked inside the NVIDIA
+# driver. Empty output means no wedge. Every caller -- the reboot path, the
+# diagnostics and the "blocked" subcommand -- goes through this, so they cannot
+# drift apart on what a wedge is.
+wedged_threads() { nvidia_wedged_threads "$(blocked_threads "$1")"; }
 
 # Filter blocked_threads output ($1) down to threads inside the NVIDIA driver.
 nvidia_wedged_threads() {
@@ -724,6 +763,49 @@ join_lines() {
 # lock is usually not the compositor anyway. Synchronous, so the stacks are
 # taken before SIGTERM starts tearing the shell down. Once per compositor PID;
 # a failed attempt is retried on the next recovery cycle.
+# Arms the backstop for the orderly reboot below. DefaultDependencies=no keeps
+# both transient units out of the shutdown transaction they are meant to
+# outlive.
+arm_forced_reboot() {
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    log_err "monitor: systemd-run is unavailable; a stalled reboot will not be forced"
+    return 0
+  fi
+  if systemd-run --quiet --collect \
+       --unit="$FORCE_REBOOT_UNIT" \
+       --on-active="${FORCE_REBOOT_AFTER_SECONDS}s" \
+       --timer-property=AccuracySec=1s \
+       --timer-property=DefaultDependencies=no \
+       --property=DefaultDependencies=no \
+       --property=Type=oneshot \
+       "$SELF" force-reboot >/dev/null 2>&1; then
+    log_info "monitor: a forced reboot is armed for ${FORCE_REBOOT_AFTER_SECONDS}s from now if the orderly one stalls"
+  else
+    log_err "monitor: could not arm the forced reboot; a stalled reboot will need the power button"
+  fi
+}
+
+# Fired by that timer: the orderly reboot has not finished. A staged ostree
+# deployment is finalized by ostree-finalize-staged.service's ExecStop, which
+# is allowed 5 minutes of its own; interrupting it loses the update, so wait
+# that out first. Single --force, i.e. kill and unmount but no dirty
+# filesystems; once systemd-shutdown is reached, RebootWatchdogSec= takes over.
+force_reboot_now() {
+  local waited=0 held=no
+  while [ "$waited" -lt "$FINALIZE_WAIT_SECONDS" ]; do
+    [ "$(systemctl is-active "$FINALIZE_UNIT" 2>/dev/null)" = "deactivating" ] || break
+    if [ "$held" = no ]; then
+      log_info "monitor: $FINALIZE_UNIT is still finalizing a staged deployment; holding the forced reboot"
+      held=yes
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  log_err "monitor: the orderly reboot did not finish within ${FORCE_REBOOT_AFTER_SECONDS}s; forcing one"
+  systemctl reboot --force ||
+    log_err "monitor: the forced reboot failed; the machine needs the power button"
+}
+
 DUMPED_BLOCKED_PID=""
 
 dump_blocked_tasks() {
@@ -742,7 +824,7 @@ dump_blocked_tasks() {
 still_wedged() {
   local uid="$1" pid="$2" wedged
   pid_is_gnome_shell_for_uid "$pid" "$uid" || return 1
-  wedged=$(nvidia_wedged_threads "$(blocked_threads "$pid")")
+  wedged=$(wedged_threads "$pid")
   [ -n "$wedged" ] || return 1
   printf '%s\n' "$wedged"
 }
@@ -787,6 +869,17 @@ handle_driver_wedge() {
     return 0
   fi
 
+  # The orderly reboot can itself stall: on 2026-09-23 it crawled through
+  # per-unit kill ladders for tasks stuck in D and had not finished 10-20
+  # minutes later. reboot.target's JobTimeoutSec= would bound it, but that
+  # setting is machine-wide, and cutting every reboot short is not safe here:
+  # ostree-finalize-staged.service finalizes a staged deployment in its
+  # ExecStop with a deliberate 5-minute timeout, and a forced reboot through
+  # that loses the update. So the bound is armed here instead, only on the
+  # recovery path, as a transient unit -- outside this service's cgroup, so
+  # stopping the monitor cannot take the backstop with it.
+  arm_forced_reboot
+
   # No explicit sync: sync(2) sleeps uninterruptibly on a stuck mount, and
   # timeout(1) waits for its child even after SIGKILL, so it could hold the
   # reboot back forever. The orderly reboot below flushes and unmounts
@@ -821,8 +914,8 @@ monitor_loop() {
 
   mkdir -p "$RUNDIR"
   log_info "monitor: started (interval=${CHECK_INTERVAL_SECONDS}s timeout=${PROBE_TIMEOUT_SECONDS}s failures=${FAILURE_LIMIT} recovery=${RECOVER_HUNG_SHELL} snapshot_timeout=${SNAPSHOT_TIMEOUT_SECONDS}s wedge_action=${DRIVER_WEDGE_ACTION} wedge_kill_after=${DRIVER_WEDGE_KILL_AFTER_SECONDS}s wedge_grace=${DRIVER_WEDGE_GRACE_SECONDS}s)"
-  if load_nvidia_symbols; then
-    log_info "monitor: NVIDIA driver-wedge detection armed (${#NVIDIA_SYMBOLS[@]} symbols)"
+  if nvidia_symbols_available; then
+    log_info "monitor: NVIDIA driver-wedge detection armed ($(wc -l < "$NVIDIA_SYMBOLS_FILE") symbols)"
   else
     log_warn "monitor: $NVIDIA_SYMBOLS_FILE missing or empty; NVIDIA driver-wedge detection is off"
   fi
@@ -1003,7 +1096,7 @@ case "${1:-monitor}" in
       echo "no such process: $pid" >&2
       exit 2
     fi
-    if ! load_nvidia_symbols; then
+    if ! nvidia_symbols_available; then
       echo "NVIDIA symbol list $NVIDIA_SYMBOLS_FILE unavailable (run as root, with the service started)" >&2
       exit 2
     fi
@@ -1013,6 +1106,10 @@ case "${1:-monitor}" in
     printf 'nvidia:  %s\n' "${wedged:-none}"
     [ -z "$wedged" ] || exit 1
     exit 0
+    ;;
+  force-reboot)
+    # Run by the transient timer that arm_forced_reboot sets up.
+    force_reboot_now
     ;;
   nvidia-symbols)
     # Run by the unit's privileged ExecStartPre; see is_nvidia_wchan.
@@ -1026,7 +1123,7 @@ case "${1:-monitor}" in
     [ "${classification%% *}" != "starved" ]
     ;;
   *)
-    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|blocked PID|nvidia-symbols|classify|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]|starvation-snapshot LABEL [REASON] [LOOKBACK]}" >&2
+    echo "usage: $0 {monitor|active-uid|gnome-pid UID|probe UID|blocked PID|nvidia-symbols|force-reboot|classify|snapshot LABEL [UID] [PID] [LOOKBACK] [standard|full]|starvation-snapshot LABEL [REASON] [LOOKBACK]}" >&2
     exit 2
     ;;
 esac
