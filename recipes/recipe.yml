@@ -18,7 +18,12 @@ modules:
         destination: / # copies files/rootfs/* (* means everything inside it) into your image's root folder /
 
   - type: dnf
-    source: ghcr.io/fromelicks/modules/dnf:latest
+    # pr-8 enables added repos in a stable order, so repos.override.d is
+    # identical across builds (docs/update-size.md). The unified image, because
+    # that PR's per-module dnf:pr-8 never published (the fork's CI fails at
+    # cosign verify). Back to modules/dnf:latest once
+    # fromelicks/blue-build-modules#8 is merged.
+    source: ghcr.io/fromelicks/modules:pr-8
     repos:
       files:
         - fury-nushell.repo
@@ -157,3 +162,13 @@ modules:
 
   - type: signing # this sets up the proper policy & signing files for signed images to work fully
     source: ghcr.io/fromelicks/modules:pr-4
+
+  # MUST stay the last module (the build workflow fails otherwise). Zeroes the
+  # mtimes that made ~40 chunkah layers (~1.6 GB) change digest every day with
+  # identical contents. ostree drops mtimes on import, so the zeroing itself is
+  # invisible when deployed; it also regenerates the fontconfig caches (which
+  # then validate at runtime) and empties the image's /run.
+  # See docs/update-size.md.
+  - type: script
+    scripts:
+      - normalize-mtimes.sh

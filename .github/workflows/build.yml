@@ -29,6 +29,20 @@ jobs:
           # !! Add your recipes here
           - recipe.yml
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # normalize-mtimes.sh only works as the last module: anything a later
+      # module writes gets a fresh mtime, and the daily re-download of
+      # unchanged layers comes back silently. See docs/update-size.md.
+      - name: Check that normalize-mtimes.sh is the last module
+        env:
+          RECIPE: recipes/${{ matrix.recipe }}
+        run: |
+          yq -e '.modules[-1].type == "script" and .modules[-1].scripts[-1] == "normalize-mtimes.sh"' "$RECIPE" ||
+            { echo "::error file=$RECIPE::normalize-mtimes.sh must be the last module (docs/update-size.md)"; exit 1; }
+
       # the build is fully handled by the reusable github action
       - name: Build Custom Image
         uses: blue-build/github-action@v1.13
