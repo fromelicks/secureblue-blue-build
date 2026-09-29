@@ -26,6 +26,7 @@ modules:
     source: ghcr.io/fromelicks/modules:pr-8
     repos:
       files:
+        - chatgpt.repo
         - fury-nushell.repo
         - gh-cli.repo
         - netbird.repo
@@ -40,6 +41,9 @@ modules:
     install:
       allow-erasing: true
       packages:
+        - repo: openai-chatgpt
+          packages:
+            - chatgpt
         - chezmoi
         - clang
         - clang-tools-extra
@@ -94,11 +98,12 @@ modules:
       - source: dms-policy
         destination: /
 
-  # Both scripts patch RPM-owned files, so they must run after dnf.
+  # These scripts patch RPM-owned files, so they must run after dnf.
   - type: script
     scripts:
       - patch-dms-lockscreen.sh # See docs/niri-dms.md.
       - vscode-standard-malloc.sh # See docs/vscode-hardened-malloc.md.
+      - chatgpt-integration.sh # Native Wayland and standard malloc; docs/chatgpt.md.
 
   - type: script
     scripts:
