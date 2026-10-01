@@ -1,0 +1,92 @@
+#!/usr/bin/bash
+# Keep the GTK3 theme's light/dark variant in step with GNOME's color scheme.
+#
+# GNOME's Style switch only writes org.gnome.desktop.interface color-scheme.
+# GTK3 ignores that key, so a dark desktop needs gtk-theme=adw-gtk3-dark, and
+# nothing switches it back. A light desktop left on adw-gtk3-dark breaks every
+# Chromium/Electron app: Chromium takes its final light/dark answer from the
+# GTK3 theme's colors and only answers the portal by toggling
+# gtk-application-prefer-dark-theme, which a dark-only theme cannot honour.
+# Claude Desktop stayed dark on a light desktop because of this.
+#
+# Idle cost is zero. dconf scopes its D-Bus match rule to the watched key, so
+# the broker drops every other dconf change before it reaches this process:
+# measured, six writes to sibling keys woke `dconf watch` zero times. Only a
+# real Style change costs anything: one `gsettings get` and at most one
+# `gsettings set`.
+#
+# Binaries are called by absolute path: the gsettings first on an interactive
+# PATH is Homebrew's, whose glib has no dconf module. It silently falls back to
+# a keyfile backend, reads schema defaults, and its writes never reach GNOME.
+#
+# See docs/gtk-theme-sync.md.
+
+set -u
+
+readonly SCHEMA=org.gnome.desktop.interface
+readonly GSETTINGS=/usr/bin/gsettings
+readonly DCONF=/usr/bin/dconf
+
+log() { printf '%s\n' "$*" >&2; }
+
+# The unit's PrivatePIDs= makes this script PID 1 of its namespace, and the
+# kernel drops any signal to a namespace's init that has no handler. Without
+# this trap, "systemctl stop" waited out the whole stop timeout.
+trap 'exit 0' TERM
+
+# GTK3's theme search path, minus its built-in resource themes: only flip to a
+# variant GTK3 can actually load, or the switch would leave an unstyled app.
+theme_exists() {
+  local dir
+  local -a dirs=("${XDG_DATA_HOME:-$HOME/.local/share}/themes" "$HOME/.themes")
+  local IFS=:
+  for dir in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+    dirs+=("$dir/themes")
+  done
+  for dir in "${dirs[@]}"; do
+    [ -d "$dir/$1/gtk-3.0" ] && return 0
+  done
+  return 1
+}
+
+# $1: the color-scheme as a GVariant string, e.g. 'prefer-dark'.
+sync_theme() {
+  local theme want
+  theme=$("$GSETTINGS" get "$SCHEMA" gtk-theme) || return 0
+  theme=${theme#\'}
+  theme=${theme%\'}
+  if [ "$1" = "'prefer-dark'" ]; then
+    want=${theme%-dark}-dark
+  else
+    want=${theme%-dark}
+  fi
+  [ "$want" != "$theme" ] || return 0
+  if ! theme_exists "$want"; then
+    log "color-scheme $1: no installed GTK3 theme '$want', keeping '$theme'"
+    return 0
+  fi
+  "$GSETTINGS" set "$SCHEMA" gtk-theme "$want" &&
+    log "color-scheme $1: gtk-theme '$theme' -> '$want'"
+}
+
+# Subscribe before the initial sync, so a change in between is not lost.
+exec {watch}< <(exec "$DCONF" watch "/${SCHEMA//.//}/color-scheme")
+sync_theme "$("$GSETTINGS" get "$SCHEMA" color-scheme)"
+
+# Each change arrives as: the key path, "  <value>" ("  unset" after a reset,
+# which falls back to the schema default), then a blank line.
+value=
+while IFS= read -r line <&"$watch"; do
+  case $line in
+    '  unset') value= ;;
+    '  '*) value=${line#  } ;;
+    '')
+      [ -n "$value" ] || value=$("$GSETTINGS" get "$SCHEMA" color-scheme)
+      sync_theme "$value"
+      value=
+      ;;
+  esac
+done
+
+log "dconf watch exited"
+exit 1

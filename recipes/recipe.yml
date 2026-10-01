@@ -126,6 +126,7 @@ modules:
     user:
       enabled:
         - syncthing.service
+        - fromelicks-gtk-theme-sync.service
 
   - type: gschema-overrides
 

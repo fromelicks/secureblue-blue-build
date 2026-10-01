@@ -108,6 +108,11 @@ It runs as a native Wayland client (`--ozone-platform=wayland`) on the Intel
 iGPU render node, so secureblue's disabled Xwayland is not a problem. The
 Quick Entry global hotkey needs the GlobalShortcuts portal on Wayland.
 
+Light/dark follows the desktop only while `gtk-theme` matches `color-scheme`:
+Chromium takes the final answer from the GTK3 theme, and `adw-gtk3-dark` kept
+the app dark on a light desktop. `fromelicks-gtk-theme-sync.service` keeps the
+two in step. See [`gtk-theme-sync.md`](gtk-theme-sync.md).
+
 ## Cowork
 
 Cowork runs its tasks in a QEMU/KVM VM that the app hosts. `qemu-system-x86`,
