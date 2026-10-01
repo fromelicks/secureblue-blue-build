@@ -1,0 +1,75 @@
+[Unit]
+Description=Keep the GTK3 theme variant in step with the GNOME color scheme
+Documentation=https://github.com/fromelicks/secureblue-blue-build/blob/main/docs/gtk-theme-sync.md
+PartOf=graphical-session.target
+After=graphical-session.target
+# Not in GDM's greeter: enabled globally, this unit would also start in the
+# gdm-greeter user manager. UID 60578 passes !@system; the home directory check
+# is what excludes it. See syncthing.service.d/10-skip-greeter.conf.
+ConditionUser=!@system
+ConditionPathIsDirectory=/var/home/%u
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/fromelicks-gtk-theme-sync
+# Exits 1 when `dconf watch` ends, e.g. if the session bus restarts.
+Restart=on-failure
+RestartSec=5s
+# SIGTERM to the script only. With the default, `dconf watch` could die first
+# and the script took the EOF for a lost watch, so a stop logged a failure. The
+# script is PID 1 of its PID namespace (PrivatePIDs= below), so the kernel
+# kills the watcher as soon as the script exits.
+KillMode=mixed
+
+# Everything the script touches: the session bus (dconf writes go through
+# dconf-service), dconf's read-only database and its runtime shm flag, which the
+# client opens read-write, and the GTK3 theme directories it checks before
+# switching. Nothing else in $HOME or /run/user is visible.
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.config/dconf
+BindReadOnlyPaths=-%h/.local/share/themes
+BindReadOnlyPaths=-%h/.themes
+BindPaths=%t/bus
+BindPaths=%t/dconf
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+# The bus is a path socket, which is reachable from any network namespace.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+PrivateIPC=yes
+# A private PID namespace gets a fresh /proc, which is what makes ProcSubset=
+# and ProtectProc= work in a user manager: without it, both were accepted and
+# silently ignored (every PID and /proc/meminfo stayed visible).
+PrivatePIDs=yes
+ProcSubset=pid
+ProtectProc=invisible
+PrivateUsers=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+KeyringMode=private
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# systemd-analyze --user security: 0.4 SAFE. What it still flags is either the
+# job itself (AF_UNIX for the bus, the %h bind mounts behind ProtectHome=tmpfs)
+# or cgroup-BPF, which a user manager cannot attach: IPAddressDeny= and
+# DevicePolicy= would raise the score and do nothing. PrivateNetwork= and
+# PrivateDevices= above are what actually cover those.
+
+[Install]
+WantedBy=graphical-session.target
