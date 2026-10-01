@@ -55,8 +55,21 @@ consistent pair and writes nothing.
 
 ## Cost
 
-The service is a sleeping `bash` plus `dconf watch` on the single key (about 8 MB).
-Idle CPU measured over 20 s: **0 µs**. dconf scopes its D-Bus match rule to the
+The service is a sleeping `bash` plus `dconf watch` on the single key. Idle
+CPU measured over 20 s: **0 µs**.
+
+Memory is about 7 MB PSS (9.5 MB cgroup), almost all of it secureblue's
+globally preloaded hardened_malloc, which costs every process the same:
+
+| Process | hardened_malloc: anon / page tables / PSS | glibc malloc: same |
+|---|---|---|
+| `bash` idle in `read` | 1736 / 528 / 2008 kB | 292 / 68 / 580 kB |
+| `dconf watch` | 2896 / 1088 / 3011 kB | 500 / 112 / 602 kB |
+
+Its many guard regions also take 4–5× the mappings (167 vs 28 for bash), which
+is part of the remaining kernel slab, along with the unit's namespaces.
+`with-standard-malloc` would bring the service to about 1.2 MB, but the watcher
+parses bus traffic, so it keeps the hardened allocator. dconf scopes its D-Bus match rule to the
 watched key, so the broker filters everything else. Six writes to sibling keys
 produced zero context switches in the watcher; one write to the key produced
 exactly one. A real Style change costs one `gsettings get` and one
@@ -72,6 +85,13 @@ Rejected alternatives:
   would fork+exec a oneshot, about 3 ms each under the hardening kargs (see
   `desktop-responsiveness.md`). That is more CPU than a watcher that never
   wakes.
+- **[dbus-action](https://github.com/bulletmark/dbus-action)** maps a D-Bus
+  signal (bus + interface + member + value) to a command. That is the right
+  tool for many triggers, but here it would be a resident Python interpreter
+  (PyGObject, dbus-python, ruamel.yaml) that is not packaged for Fedora. It
+  would match the portal's `SettingChanged`, one signal shared by every
+  setting, so it would wake on unrelated changes unless the match rule filters
+  on arguments. The switch logic would still need a script.
 - **`gsettings monitor`** subscribes to the whole schema directory and wakes
   for every `org.gnome.desktop.interface` key (clock, fonts, scaling…).
 
