@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# Point the system resolver at the VPN's DNS while an AmneziaWG tunnel is up.
+#
+# usage: fromelicks-awg-dns up <server> [server...]
+#        fromelicks-awg-dns down
+#
+# Called from PostUp/PreDown in /etc/amnezia/amneziawg/<iface>.conf.
+#
+# awg-quick's own `DNS =` handling cannot work on this host. It shells out to
+# `resolvconf`, which here is a symlink to resolvectl from systemd-resolved --
+# and systemd-resolved is masked, because secureblue resolves through dnsconfd
+# driving unbound. That same dead end is why AmneziaVPN's daemon logged
+# "No suitable DNS manager found". So the config leaves `DNS =` commented out
+# and calls this instead.
+#
+# With AllowedIPs = 0.0.0.0/0 the tunnel carries everything *except* what a
+# more specific route keeps on the LAN -- and the resolver dnsconfd forwards to
+# is usually the LAN router, which stays on the LAN. Left alone that leaks
+# every lookup to the router in cleartext while the rest of the traffic is
+# tunnelled. `--mode exclusive` means only these servers may resolve anything,
+# so lookups follow the default route into the tunnel.
+#
+# Teardown restarts dnsconfd rather than replaying a saved list: dnsconfd is a
+# NetworkManager DNS plugin and repopulates itself from NM on start, which
+# restores the per-connection split-DNS (the work WireGuard tunnel's internal
+# zone) without this script having to understand it.
+
+set -euo pipefail
+
+readonly PROG="${0##*/}"
+readonly UNIT='dnsconfd.service'
+
+log() { printf '%s: %s\n' "${PROG}" "$*" >&2; }
+fail() { log "$*"; exit 1; }
+
+case "${1:-}" in
+    ''|-h|--help)
+        sed -n '3,6p' "$0" | sed 's/^# \?//'
+        exit 0
+        ;;
+esac
+
+(( EUID == 0 )) || fail 'must run as root'
+
+# Not every machine running this image resolves through dnsconfd. Where it is
+# not in use there is nothing to hand over to, and saying so beats guessing.
+dnsconfd_active() {
+    command -v dnsconfd >/dev/null && systemctl is-active --quiet "${UNIT}"
+}
+
+action="${1:-}"
+shift || true
+
+case "${action}" in
+    up)
+        (( $# )) || fail 'usage: '"${PROG}"' up <server> [server...]'
+        if ! dnsconfd_active; then
+            fail "${UNIT} is not active; refusing to bring the tunnel up with
+       unprotected DNS. Configure DNS by hand, or drop the PostUp/PreDown
+       lines from the tunnel config if that is what you want."
+        fi
+        log "routing all DNS to $* (exclusive)"
+        # Failing here aborts PostUp, and awg-quick then tears the interface
+        # back down -- which is the behaviour we want. A tunnel whose DNS still
+        # points at the LAN router is worse than no tunnel.
+        dnsconfd update --mode exclusive "$@" ||
+            fail 'dnsconfd update failed; tunnel will be rolled back'
+        ;;
+    down)
+        # Teardown must never fail: awg-quick runs PreDown while dismantling
+        # the interface, and an error here would strand it half-configured.
+        if dnsconfd_active; then
+            log 'restoring resolver configuration from NetworkManager'
+            systemctl try-restart "${UNIT}" || log 'WARNING: could not restart '"${UNIT}"
+        else
+            log "${UNIT} not active; nothing to restore"
+        fi
+        ;;
+    *)
+        fail "unknown action '${action}' (expected: up, down)"
+        ;;
+esac
