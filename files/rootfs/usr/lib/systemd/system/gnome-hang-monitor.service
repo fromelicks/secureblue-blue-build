@@ -45,6 +45,15 @@ Environment=DRIVER_WEDGE_ACTION=reboot
 Environment=DRIVER_WEDGE_KILL_AFTER_SECONDS=15
 Environment=DRIVER_WEDGE_GRACE_SECONDS=60
 
+# That orderly reboot can stall for 10-20 minutes behind tasks stuck in D, so
+# the monitor arms a transient timer that forces one after FORCE_REBOOT_AFTER
+# seconds. The timer is a separate unit, not a child of this service, so it
+# outlives the shutdown transaction it is bounding. It first waits out an
+# ostree-finalize-staged.service that is still finalizing a staged deployment
+# (up to FINALIZE_WAIT), because cutting that short loses the update.
+Environment=FORCE_REBOOT_AFTER_SECONDS=180
+Environment=FINALIZE_WAIT_SECONDS=360
+
 # Snapshots run detached from the check loop under this hard bound, so a slow
 # collection can no longer stretch the interval between health checks. It MUST
 # stay below CHECK_INTERVAL_SECONDS: only one snapshot may be in flight, so a
@@ -66,6 +75,13 @@ Environment=PSI_MEM_FULL_THRESHOLD=25
 # ${EPOCHREALTIME} renders its decimal separator per locale; the spawn-latency
 # probe parses it as an integer.
 Environment=LC_ALL=C
+
+# A diagnostic read that blocked in the wedged driver cannot be killed, so this
+# unit can reach shutdown with unkillable children in its cgroup. systemd then
+# walks the full stop ladder (SIGTERM, watchdog, SIGKILL) at TimeoutStopSec per
+# rung before giving up, which on 2026-09-23 added ~2 minutes to a reboot that
+# existed to end a wedge. The monitor itself exits on SIGTERM immediately.
+TimeoutStopSec=10s
 
 RuntimeDirectory=gnome-diagnostics
 RuntimeDirectoryMode=0700

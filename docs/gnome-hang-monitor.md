@@ -34,14 +34,30 @@ monitor records a snapshot under the `gnome-diagnostics` journal identifier:
   kernel stacks;
 - best-effort userspace backtraces from `eu-stack`;
 - user-session and inhibitor state;
-- DRM cards, connector state, runtime power state, and bounded `nvidia-smi`
-  output;
+- DRM cards, connector state, runtime power state, and the DRM debugfs
+  `clients` list. `nvidia-smi` and the debugfs `state` file both enter the
+  driver, so both are **skipped while the compositor has a thread blocked
+  inside it** — such a read blocks in `D` where nothing can kill it and leaves
+  a process behind that later delays shutdown. A missing PID or symbol list
+  counts as "cannot tell" and skips too
+  (see [`nvidia-dpms-lock-hang.md`](nvidia-dpms-lock-hang.md));
 - every process holding a DRM device, including its SELinux domain and DRM
   client/engine/memory accounting from `/proc/*/fdinfo` (bounded to 20 seconds
   and 4000 processes);
 - recent display, suspend/resume, and SELinux denial events from the system
   journal;
 - recent kernel warnings and user-session logs.
+
+The unit sets `TimeoutStopSec=10s`, because a diagnostic read that did block
+in the driver cannot be killed and would otherwise cost 45 s per stop rung.
+
+**A wedge recovery bounds its own reboot.** Before running `systemctl reboot`,
+the monitor arms a transient `systemd-run` timer that forces a reboot 180 s
+later if the orderly one stalls, after waiting out any in-progress
+`ostree-finalize-staged.service`. This is deliberately *not* a
+`reboot.target.d/` drop-in: that would bound every reboot on the machine,
+including the one that finalizes a `bootc upgrade`. See
+[`nvidia-dpms-lock-hang.md`](nvidia-dpms-lock-hang.md).
 
 Snapshots run **detached from the check loop**, reniced to +19, one at a time,
 and the loop sleeps to the next wall-clock tick boundary (with a 5 s floor). A
