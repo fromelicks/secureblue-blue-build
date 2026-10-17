@@ -109,6 +109,14 @@ modules:
     scripts:
       - install-netbird.sh
 
+  # AmneziaWG (WireGuard + obfuscation) is packaged for neither Fedora nor a
+  # usable COPR, so awg/awg-quick and the amneziawg-go datapath are built from
+  # pinned, SHA-verified tags. After dnf: it pulls libmnl-devel, then removes
+  # it again. See docs/amneziawg.md.
+  - type: script
+    scripts:
+      - install-amneziawg.sh
+
   # Unpacks Anthropic's signed .deb (there is no RPM yet) and wraps the
   # launcher in with-standard-malloc. After dnf: needs `ar` from binutils.
   # See docs/claude-desktop.md.

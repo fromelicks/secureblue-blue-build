@@ -200,6 +200,22 @@ These gate multiple features. Verified against secureblue source.
     fails if it is not). Preview any update
     with `ujust update-diff`. See [`docs/update-size.md`](docs/update-size.md).
 
+17. **`systemd-resolved` is masked; DNS is dnsconfd driving unbound.**
+    `/etc/resolv.conf` points at `127.0.0.1` (unbound), and dnsconfd feeds
+    unbound its forwarders from **NetworkManager** — which is how the
+    NM-managed work WireGuard connection gets its split-DNS zone. The trap: `/usr/bin/resolvconf` exists, but it is a symlink
+    to `resolvectl` from the masked systemd-resolved. Every tool that
+    configures DNS "portably" by calling `resolvconf` therefore fails on a host
+    where `command -v resolvconf` succeeds — this is exactly what `wg-quick`'s
+    (and `awg-quick`'s) `DNS =` does, and what made AmneziaVPN's daemon log
+    `No suitable DNS manager found`. Drive dnsconfd directly instead:
+    `dnsconfd update --mode exclusive <server…>` to take over resolution, and
+    `systemctl try-restart dnsconfd` to restore, since it repopulates from NM
+    on start. Modes are `backup`/`prefer`/`exclusive`. **NetBird additionally
+    overwrites `/etc/resolv.conf`** outright (original at
+    `/etc/resolv.conf.original.netbird`), so three managers contend for that one
+    file. See [`docs/amneziawg.md`](docs/amneziawg.md).
+
 ## Feature implementation plan
 
 | Feature | Where | How | Notes / gotchas |
@@ -218,6 +234,7 @@ These gate multiple features. Verified against secureblue source.
 | **Claude Desktop** | image | `install-claude-desktop.sh` unpacks Anthropic's `.deb` (no RPM exists) after verifying pinned key → `InRelease` → `Packages` → `.deb` SHA256; newest version each build | hardened_malloc opt-out (constraint 8). `chrome-sandbox` SUID bit dropped: the userns sandbox works. Cowork untested (needs `/dev/vhost-vsock` + `kvm` group). See [`docs/claude-desktop.md`](docs/claude-desktop.md). |
 | **ChatGPT** | image | Official `chatgpt` RPM from `openai-chatgpt`, with pinned key and package + metadata signature checks; `chatgpt-integration.sh` runs after dnf | Native Wayland by default (experimental upstream), standard allocator wrapper; no XWayland enablement. See [`docs/chatgpt.md`](docs/chatgpt.md). |
 | **MATLAB R2026a + Simulink** | manual install at runtime, run from a distrobox | `/etc/distrobox/matlab.ini` template + `fromelicks-matlab-box-setup` (container init hook) + `fromelicks-xwayland-isolated`; MATLAB installed by hand into `~/.local/share/matlab-distrobox/R2026a`, then `ujust matlab-box` / `ujust matlab`. See [`docs/matlab-distrobox.md`](docs/matlab-distrobox.md) | Needs `set-container-userns on`; does **NOT** need `set-xwayland on` — a private Xwayland via `xwayland-satellite` works under Mutter with `--no-x11` still on, with hardware GL. `hardened_malloc` **kills** MATLAB's CEF UI process, installer included — every entry point must `unset LD_PRELOAD`. distrobox's bare `SHELL=bash` makes every MATLAB `system()`/`mex`/Coder build fail with 127 — the manifest sets `SHELL=/bin/bash` container-wide. `mpm --source` cannot install from the release ISO (bogus "Download failed"; really a signature error) — use the ISO's own installer. Base is `registry.access.redhat.com/ubi9/toolbox` (trusted + MathWorks-supported); `quay.io/toolbx-images` went auth-only. ~25 GB on a host volume. Network license via `MLM_LICENSE_FILE`; host netns means VPN routing just works — never set `unshare_netns`. |
+| **AmneziaWG (obfuscated WireGuard)** | image (stack) + runtime (tunnel config) | `install-amneziawg.sh` builds `amneziawg-tools` + `amneziawg-go` from pinned, SHA-verified **v3.1** tags (nothing is packaged: the upstream COPR has zero Fedora chroots and is 2024-vintage); tunnels are `awg-quick@<iface>` reading `/etc/amnezia/amneziawg/<iface>.conf`. `ujust awg-import/up/down/status/check`. See [`docs/amneziawg.md`](docs/amneziawg.md) | The **AmneziaVPN GUI client cannot work here** and takes the network down trying — X11-only Qt, no `pkexec`, `sudo`-based `post_install.sh`, and a daemon whose netlink route reader overflows an 8 KiB buffer when secondary route tables exist (NetBird's), so it arms its default-deny kill switch, fails to install any route, and leaves the kill switch armed. Purged 2026-09-30. No kernel module — `awg-quick` falls back to `amneziawg-go`. Never use `DNS =` (constraint 17). |
 | **GSConnect / KDEConnect** | image | use Fedora `dnf` package `gnome-shell-extension-gsconnect` (NOT the gnome-extensions module — the EGO build is hard-coded to user paths and fails system-wide); enable via gschema-override; open firewall 1714-1764 | |
 
 ## Open decisions (confirm with the user before implementing)
