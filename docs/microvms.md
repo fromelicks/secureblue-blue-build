@@ -10,6 +10,43 @@ podman run --rm --runtime krun registry.access.redhat.com/ubi9/ubi:latest uname 
 This prints the libkrunfw guest kernel (`6.12.91` with `libkrunfw-5.5.0`), not
 the host's `7.2.5-200.secureblue`. `ujust krun-check` runs that comparison.
 
+## Daily use: `krun-box`
+
+Raw `podman run --runtime krun` needs several non-obvious flags to be usable as a
+workstation (see [Traps](#traps-and-why-krun-box-exists) below).
+`/usr/bin/krun-box` (also `ujust krun-box`) wraps them:
+
+```
+krun-box -- krun-box-setup                 # once: install juliaup + opencode into the box
+krun-box -v ~/Repos/myproj                 # shell in the VM, project at /work/myproj
+krun-box -v ~/Repos/myproj -- opencode     # opencode in the project
+krun-box -m 16 -c 12 -- julia              # bigger VM: 16 GiB, 12 vCPUs (default 8 / 8)
+krun-box -n scratch -- bash -l             # a separate box with its own persistent home
+```
+
+- **Every call boots a fresh VM.** What persists is the podman volume
+  `krun-NAME-home` (default `NAME=dev`), mounted as the guest's `/root`: juliaup,
+  the Julia depot, opencode and its config and login, shell history. juliaup and
+  opencode are installed *into the volume*, not the image, so `juliaup update`
+  and `opencode upgrade` work and survive image rebuilds.
+- **The image** `localhost/krun-box` is built from
+  `/usr/share/fromelicks/krun-box/` (UBI 9 + git, unzip, less, ncurses) on first
+  use, and rebuilt automatically when a future image update changes that
+  directory (content hash in the `fromelicks.krun-box.hash` label). docker.io is
+  `reject` in policy.json, which is why the base is UBI.
+- **`-v HOSTDIR[:GUESTDIR]`** shares a project directory read-write (default
+  guest path `/work/<basename>`, which also becomes the working directory).
+  Guest root writes files the host sees as owned by uid 1000.
+- **Several shells** means several `krun-box` calls: separate VMs sharing the
+  same volume. There is no `podman exec` into a running one, and UBI ships no
+  `tmux`.
+- Remove a box and everything installed in it with
+  `podman volume rm krun-NAME-home`.
+
+Measured on the Legion: Julia `Pkg.add("DataFrames")` with precompilation takes
+147.5 s in the VM vs 138.8 s under plain crun; a warm `using DataFrames` is
+0.51 s vs 0.39 s.
+
 ## What gets installed
 
 `crun-krun` is only the `/usr/bin/krun` symlink to `crun`. crun switches to krun
@@ -74,7 +111,52 @@ podman run --rm --runtime krun \
 
 Also available: `krun.nested_virt=1` (the host has `kvm_intel nested=Y`) and
 `krun.gpu_flags=` for virtio-gpu. The full list is in `man 1 krun`. An image can
-carry the same defaults in a `/.krun_vm.json`.
+carry the same defaults in a `/.krun_vm.json`. With raw podman, give `--memory`
+about 25% more than `krun.ram_mib` (see below).
+
+## Traps, and why `krun-box` exists
+
+All found on the Legion with crun 1.28, libkrun 1.19 and libkrunfw 5.5.0.
+
+- **No `podman exec`.** krun fails it with `the handler does not support exec`.
+  `distrobox enter` and `toolbox enter` *are* `podman exec`, so neither can work
+  with krun: a distrobox created with `--additional-flags "--runtime krun"` runs
+  its init inside the VM and then can never be entered. The container's main
+  process is the session.
+- **No TTY for the guest process.** Even with `-it`, `tty` in the guest prints
+  `not a tty`, so REPLs and TUIs misbehave. crun's krun handler does not set up
+  a console. `krun-box` runs the command under `script -qec` in the guest,
+  which allocates a guest-side pty, and passes the host terminal's size with
+  `stty`. **Resizing the window afterwards does not propagate.**
+- **Random MCS levels break named volumes.** The VMM runs as
+  `container_kvm_t` with a fresh random MCS level per `podman run`. A file
+  created directly in a volume inherits the volume's shared `s0` label, but a
+  file an installer stages in `/tmp` (the container's own rootfs) and `mv`s
+  into the volume keeps that run's private categories, and every later run is
+  denied it: the opencode installer does exactly this (`Permission denied`,
+  exit 126). `krun-box` pins a fixed level per box name
+  (`--security-opt label=level:s0:cA,cB`, derived from the name), which keeps
+  such files usable and still keeps other containers out.
+- **Memory is outside `app.slice`.** krun containers land in
+  `user@1000.service/user.slice/libpod-*.scope`, so the `app.slice`
+  `MemoryHigh` from `docs/memory-pressure-hangs.md` does not apply. This is
+  mostly fine: when the guest fills its RAM, the *guest* kernel OOM-kills the
+  process and the VM and desktop carry on. But the host-side `--memory` cap needs
+  headroom over the guest RAM: with the two equal, the host cgroup hit
+  `memory.max` 408 times in one test (reclaim stalls on the VMM); 25% headroom
+  brought that to 0. `krun-box` sets `krun.ram_mib` and `--memory` = 1.25x.
+- **`:Z` host mounts relabel recursively.** SELinux needs the shared directory
+  relabelled for `container_kvm_t` to reach it, and `:Z` does that for the whole
+  tree. `krun-box` therefore only accepts an **allowlist**: a directory at least
+  two levels inside `$HOME`, under no dot-directory, whose current type is
+  `user_home_t` or `container_file_t`. A denylist was tried first and let
+  `$HOME` through (it is `/home/licks`, a symlink to `/var/home/licks`), which
+  relabelled ~900k files; that was repaired with `podman unshare restorecon -F`
+  on exactly the files carrying the bad level. Do not loosen this check.
+- **Fully cached builds are rejected by policy.** A build whose result matches
+  an existing local image is committed as a copy from `containers-storage`, and
+  secureblue's policy.json rejects that transport (`Source image rejected ...
+  rejected by policy`). `krun-box` builds with `--no-cache`.
 
 ## Interaction with secureblue hardening
 

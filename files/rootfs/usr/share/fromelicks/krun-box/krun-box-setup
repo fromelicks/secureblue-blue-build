@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Install juliaup and opencode into /root (the persistent volume) if missing.
+# Both then update themselves: `juliaup update`, `opencode upgrade`.
+set -euo pipefail
+if ! command -v juliaup >/dev/null; then
+    curl -fsSL https://install.julialang.org | sh -s -- --yes --default-channel release
+fi
+if ! command -v opencode >/dev/null; then
+    curl -fsSL https://opencode.ai/install | bash
+fi
+echo "julia:    $(julia --version)"
+echo "opencode: $(opencode --version)"
