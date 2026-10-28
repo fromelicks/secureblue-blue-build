@@ -3,7 +3,7 @@
 # image will be published to ghcr.io/<user>/<name>
 name: secureblue-nvidia-open-hardened
 # description will be included in the image's metadata
-description: secureblue with GNOME, an optional Niri session, open NVIDIA and a few personal tweaks
+description: secureblue with GNOME, Niri tooling, open NVIDIA and a few personal tweaks
 
 # the base image to build on top of (FROM) and the version tag to use
 base-image: ghcr.io/secureblue/silverblue-nvidia-open-hardened
@@ -37,7 +37,6 @@ modules:
           - name: wezfurlong/wezterm-nightly
             chroot: fedora-44-x86_64
     install:
-      allow-erasing: true
       packages:
         - repo: openai-chatgpt
           packages:
@@ -78,6 +77,14 @@ modules:
           packages:
             - terra-release
             - terra-gpg-keys
+
+  # Keep Niri out of GDM until the replacement shell has a working locker,
+  # idle/suspend handling, notifications, and polkit agent. See docs/niri.md.
+  # Apply after dnf so the RPM's session entry cannot replace this policy.
+  - type: files
+    files:
+      - source: niri-session-policy
+        destination: /
 
   # These scripts patch RPM-owned files, so they must run after dnf.
   - type: script

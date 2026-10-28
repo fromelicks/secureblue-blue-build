@@ -89,7 +89,12 @@ These gate multiple features. Verified against secureblue source.
    `crw-rw-rw- root:kvm`; an unprivileged QEMU guest reports `query-kvm` enabled, so the
    hardening kargs, lockdown and SELinux do not block guests (verified 2026-09-18). Re-check
    if the base image's karg set changes. Note the Bash sandbox masks `/dev/kvm`.
-7. **Xwayland is off.** Toggle on for Steam/gaming (`ujust set-xwayland on`, needs relogin).
+7. **GNOME's Xwayland is off.** Toggle on for Steam/gaming in GNOME
+   (`ujust set-xwayland on`, needs relogin). This Silverblue toggle does not
+   affect Niri: its on-demand `xwayland-satellite` integration must be disabled
+   separately with `xwayland-satellite { off; }` in the user's Niri config.
+   Niri is currently hidden from GDM pending a replacement shell and tested
+   idle/suspend locker. See [`docs/niri.md`](docs/niri.md).
    Electron >= 38 picks Wayland by itself (VS Code 1.137 ships Electron 42, no flag needed);
    only older Electron apps need `--ozone-platform-hint=auto`.
 8. **hardened_malloc is globally preloaded.** Some apps (Steam) require it disabled per-app.
