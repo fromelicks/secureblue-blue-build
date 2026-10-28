@@ -58,3 +58,39 @@ jobs:
           chunkah: true
           build_opts: --chunkah-version v0.6.0
           use_cache: true
+
+  report-scheduled-failure:
+    name: Report scheduled build failure
+    needs: bluebuild
+    if: ${{ always() && github.event_name == 'schedule' && needs.bluebuild.result == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue if no build-failure issue is open
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE='Scheduled image build is failing'
+          ISSUE=$(gh issue list --state open --search '"Scheduled image build is failing" in:title' \
+            --json number,title --jq '.[] | select(.title == "Scheduled image build is failing") | .number')
+          if [[ -n "$ISSUE" ]]; then
+            echo "A scheduled-build failure is already tracked: $ISSUE"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/build-failure.md" <<EOF
+          A scheduled image build failed: $RUN_URL
+
+          Daily builds carry secureblue base updates into this image. While they fail,
+          the published image stops receiving those updates, even if the failing step
+          belongs to an optional application.
+
+          Investigate the failed step and restore the build. This issue deduplicates
+          further scheduled failures; check the Actions history for subsequent runs.
+          Close it after a successful scheduled build so a later regression opens a
+          new issue.
+          EOF
+          gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/build-failure.md"
