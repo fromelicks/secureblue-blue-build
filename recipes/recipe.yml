@@ -3,7 +3,7 @@
 # image will be published to ghcr.io/<user>/<name>
 name: secureblue-nvidia-open-hardened
 # description will be included in the image's metadata
-description: secureblue with GNOME, an optional Niri/DMS session, open NVIDIA and a few personal tweaks
+description: secureblue with GNOME, an optional Niri session, open NVIDIA and a few personal tweaks
 
 # the base image to build on top of (FROM) and the version tag to use
 base-image: ghcr.io/secureblue/silverblue-nvidia-open-hardened
@@ -36,8 +36,6 @@ modules:
         enable:
           - name: wezfurlong/wezterm-nightly
             chroot: fedora-44-x86_64
-          - name: avengemedia/dms
-            chroot: fedora-44-x86_64
     install:
       allow-erasing: true
       packages:
@@ -50,7 +48,6 @@ modules:
         - code # repo: files:vscode.repo
         - compiler-rt
         - crun-krun # podman --runtime krun: containers in libkrun microVMs. See docs/microvms.md.
-        - dms # repo: copr:copr.fedorainfracloud.org:avengemedia:dms
         - emacs
         - fish
         - foot
@@ -70,8 +67,6 @@ modules:
         - mise
         - nushell # repo: files:fury-nushell.repo
         - niri
-        - quickshell # repo: coprdep:copr.fedorainfracloud.org:avengemedia:danklinux
-        - qt6-qtdeclarative-devel # ships qmllint-qt6 for DMS's `make lint-qml`
         - rclone
         - sbcl
         - syncthing
@@ -83,25 +78,10 @@ modules:
           packages:
             - terra-release
             - terra-gpg-keys
-    remove:
-      # It owns /usr/bin/qs and must not remain alongside AvengeMedia's
-      # quickshell. This also cleans up images built before quickshell was
-      # selected explicitly.
-      auto-remove: false
-      packages:
-        - noctalia-qs
-
-  # Apply distribution policy after installing DMS so a future RPM-owned file
-  # at the same path cannot replace the image's policy.
-  - type: files
-    files:
-      - source: dms-policy
-        destination: /
 
   # These scripts patch RPM-owned files, so they must run after dnf.
   - type: script
     scripts:
-      - patch-dms-lockscreen.sh # See docs/niri-dms.md.
       - vscode-standard-malloc.sh # See docs/vscode-hardened-malloc.md.
       - chatgpt-integration.sh # Native Wayland and standard malloc; docs/chatgpt.md.
 
