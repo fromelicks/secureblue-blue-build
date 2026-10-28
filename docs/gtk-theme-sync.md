@@ -50,7 +50,7 @@ which a fixed `adw-gtk3` would not.
 - Logs: `journalctl --user -u fromelicks-gtk-theme-sync`. One line per actual
   switch.
 
-Under Niri, DankMaterialShell sets both keys itself. The service then sees a
+Under Niri, if the selected shell sets both keys itself, the service sees a
 consistent pair and writes nothing.
 
 ## Cost

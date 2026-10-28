@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Niri
+Comment=A scrollable-tiling Wayland compositor
+Exec=niri-session
+Type=Application
+DesktopNames=niri
+# DMS was removed; expose the session again only with a tested replacement.
+Hidden=true
