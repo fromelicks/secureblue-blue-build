@@ -34,33 +34,33 @@ were made against the older target.
 
 ## How the installer works
 
-- It downloads `https://github.com/paperwm/PaperWM/archive/<rev>.tar.gz` and
-  checks it against a pinned SHA256. The commit is pinned, not the tag,
-  because tags move.
+- It fetches the pinned commit with `git fetch --depth 1 <repo> <rev>`. Git
+  checks the content against the commit hash, so the commit is the only pin.
+  The commit is pinned, not the tag, because tags move. GitHub's generated
+  archives are not byte-stable, so pinning a SHA256 of one would add a
+  second value to keep in step and a false-alarm failure mode.
 - It fails the build if the image's `gnome-shell --version` major is not in
   `metadata.json`'s `shell-version`. GNOME Shell would otherwise refuse the
   extension at login without a visible error.
 - It installs the same file set as PaperWM's `make release`: `*.js`, `*.ui`,
   `config/`, `resources/`, `metadata.json`, `stylesheet.css` and `LICENSE`.
+  It copies `config/*`, `schemas/*.gschema.xml` and `resources/` by glob, so
+  a file upstream adds there is not dropped silently, and it sets every mode
+  explicitly instead of relying on the build's umask.
 - It compiles the schema into the extension's **own** `schemas/` directory.
   PaperWM opens `gschemas.compiled` from there, which is the same quirk the
   module special-cased.
 
 ## Updating
 
-1. Pick a release commit:
-   `gh api repos/paperwm/PaperWM/git/ref/tags/<tag> --jq .object.sha`.
-2. Hash it:
-   `curl -fsSL https://github.com/paperwm/PaperWM/archive/<sha>.tar.gz | sha256sum`.
-3. Update `rev` and `sha256` together in `install-paperwm.sh`.
+1. Get the release's commit:
+   `gh api repos/paperwm/PaperWM/commits/<tag> --jq .sha`. This peels
+   annotated tags too, whereas `git/ref/tags/<tag> --jq .object.sha` would
+   return the tag object's SHA, not the commit's.
+2. Set `rev` (and its `# <tag>` comment) in `install-paperwm.sh`.
 
 A failed build saying "does not support GNOME N" means the base moved to a new
 GNOME before PaperWM declared support for it.
-
-GitHub's generated archives have changed byte-for-byte once before (2023,
-later reverted). A checksum mismatch on an unchanged `rev` is most likely
-that, not tampering. Confirm with `git clone` + `git checkout <rev>` before
-re-pinning.
 
 ## Known GNOME 51 issues upstream
 
