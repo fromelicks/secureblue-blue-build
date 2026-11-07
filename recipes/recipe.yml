@@ -117,9 +117,12 @@ modules:
 
   - type: gschema-overrides
 
-  - type: gnome-extensions
-    install:
-      - 6099 # PaperWM
+  # PaperWM from a pinned upstream commit: extensions.gnome.org rejected its
+  # GNOME 51 build, and the gnome-extensions module installs only what EGO
+  # approved. See docs/paperwm.md.
+  - type: script
+    scripts:
+      - install-paperwm.sh
 
   - type: default-flatpaks
     configurations:
