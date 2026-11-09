@@ -38,6 +38,17 @@ FINALIZE_UNIT=ostree-finalize-staged.service
 FINALIZE_WAIT_SECONDS=${FINALIZE_WAIT_SECONDS:-360}
 BLOCKED_TASKS_DUMP_UNIT=fromelicks-sysrq-show-blocked.service
 
+# A compositor's /proc/<pid>/maps is 11,000-12,000 lines, which on its own
+# exceeds journald's per-unit rate limit for a 30 s window and took every later
+# section of the snapshot with it in all four 2026-10/11 wedge incidents. The
+# unit raises that limit, but the map is still the one section whose size is
+# unbounded and whose tail is the least useful, so cap it: the head covers the
+# executable mappings an address from a backtrace is likely to fall in, and the
+# dropped-line count keeps the record honest.
+MEMORY_MAP_MAX_LINES=${MEMORY_MAP_MAX_LINES:-400}
+case "$MEMORY_MAP_MAX_LINES" in ''|*[!0-9]*) MEMORY_MAP_MAX_LINES=400 ;; esac
+[ "$MEMORY_MAP_MAX_LINES" -ge 1 ] || MEMORY_MAP_MAX_LINES=400
+
 # These decide whether the machine reboots, so a drifted value must not quietly
 # shorten the wait. A non-integer ("60s") would make the grace loop's test fail
 # and skip straight to the reboot; fall back to the default and clamp to a floor
@@ -186,6 +197,22 @@ print_proc_file() {
   fi
 }
 
+# As above, but keeps only the first $2 lines and says how many there were. Two
+# reads of the same /proc file, which is cheap and cannot block: these are
+# generated on read and never wait on a device.
+print_proc_file_head() {
+  local path="$1" limit="$2" total=""
+  if [ ! -r "$path" ]; then
+    printf '(unavailable)\n'
+    return 0
+  fi
+  total=$(wc -l <"$path" 2>/dev/null) || total=""
+  if [ -n "$total" ] && [ "$total" -gt "$limit" ]; then
+    printf '(%s lines total; showing the first %s)\n' "$total" "$limit"
+  fi
+  head -n "$limit" "$path" 2>/dev/null || printf '(read failed)\n'
+}
+
 # ── system-wide starvation detection ───────────────────────────────────────
 #
 # A failed health probe only proves that no reply arrived within the timeout.
@@ -304,8 +331,8 @@ collect_thread_state() {
     esac
   done
 
-  echo "--- gnome-shell memory map ---"
-  print_proc_file "/proc/$pid/maps"
+  echo "--- gnome-shell memory map (bounded) ---"
+  print_proc_file_head "/proc/$pid/maps" "$MEMORY_MAP_MAX_LINES"
 
   # eu-stack is the only expensive part of this function -- it stops the target
   # to unwind it -- so it is the only part gated on full detail. wchan, syscall
@@ -434,7 +461,9 @@ collect_drm_clients() {
       seen[$key]=1
       comm=$(cat "$proc/comm" 2>/dev/null || printf unknown)
       uid=$(awk '/^Uid:/ { print $2; exit }' "$proc/status" 2>/dev/null)
-      context=$(cat "$proc/attr/current" 2>/dev/null || printf unavailable)
+      # NUL-terminated, so a plain command substitution logs a bash warning per
+      # process -- noise in the one journal window we are trying to preserve.
+      context=$(tr -d '\0' <"$proc/attr/current" 2>/dev/null || printf unavailable)
       echo "[pid=$pid uid=${uid:-unknown} comm=$comm device=$target context=$context]"
 
       # Record every fdinfo entry for this process/device pair. DRM fdinfo

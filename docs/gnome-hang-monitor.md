@@ -32,6 +32,8 @@ monitor records a snapshot under the `gnome-diagnostics` journal identifier:
 
 - GNOME Shell process and per-thread state, kernel wait channels, syscalls, and
   kernel stacks;
+- its memory map, bounded to `MEMORY_MAP_MAX_LINES` (400) lines with the total
+  line count printed;
 - best-effort userspace backtraces from `eu-stack`;
 - user-session and inhibitor state;
 - DRM cards, connector state, runtime power state, and the DRM debugfs
@@ -74,6 +76,17 @@ that shows whether a hang is progressing. The pre-recovery collection is the
 exception: it **pre-empts** whatever is in flight and gets
 `FULL_SNAPSHOT_TIMEOUT_SECONDS` (60 s), because it is the last chance to capture
 this compositor before it is signalled.
+
+A snapshot is thousands of journal lines, which is more than journald's
+per-unit default (`RateLimitBurst=10000` per 30 s) allows. It silently dropped
+the tail of every snapshot in all four 2026-10/11 lock-screen wedges, and the
+tail is where the display diagnostics are — see
+[`nvidia-dpms-lock-hang.md`](nvidia-dpms-lock-hang.md). The unit therefore
+raises the limit to `LogRateLimitBurst=60000` and the script bounds the one
+section whose size was unbounded, `/proc/<pid>/maps`. Keep both: raising the
+limit alone leaves a 12,000-line section competing with the sections that
+matter, and bounding the map alone leaves no headroom for the DRM client walk
+on a machine with many processes.
 
 Per-thread wait channels, syscalls and kernel stacks are captured at *every*
 detail level — they are plain `/proc` reads. Only `eu-stack` and the system-wide
