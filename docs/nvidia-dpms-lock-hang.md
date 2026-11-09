@@ -385,24 +385,60 @@ reset leaves no dump, so the evidence still has to come from the monitor's
 snapshots taken before the reboot — which is why their rate limiting
 (below) mattered enough to fix in the same change.
 
-**Not yet observed firing.** `RuntimeWatchdogSec=` is verifiable after a reboot
-with `systemctl show -p RuntimeWatchdogUSec` (expect `120000000`) and
-`cat /sys/class/watchdog/watchdog0/state` (expect `active`), but like the
-forced-reboot timer before it, the reset itself is only proven by the next
-wedge. Unlike that timer, nothing in its path runs in userspace.
+That also puts the snapshots on a clock. journald syncs the journal to disk
+immediately only at priority `<= LOG_CRIT`; everything else waits for
+`SyncIntervalSec` (5 min) plus kernel writeback, and a hardware reset two
+minutes later takes the page cache with it. The previous failure mode gave
+writeback 69 minutes; this one may not. The monitor therefore logs the two
+lines that immediately precede a reboot at `crit`, which forces a sync of
+everything written before them, the last snapshot included.
 
-**A narrower fix exists and is not applied.** Masking
-`plymouth-reboot.service`, or booting with `plymouth.enable=0`, removes the
-specific start job that blocks the reboot. It is not applied because it treats
-one symptom of a wedged DRM device — `systemd-reboot.service` could equally
-block on any other DRM consumer — and because `plymouth.enable=0` is a karg,
-which on this image is a one-way door (see
-[`kernel-arguments.md`](kernel-arguments.md), constraint 13). Worth
-reconsidering if the watchdog turns out to be insufficient.
+**Verify the hardware timeout, not the configured one.**
+`systemctl show -p RuntimeWatchdogUSec` echoes what was parsed from
+`system.conf.d`, and `/sys/class/watchdog/watchdog0/state` only reports that
+`/dev/watchdog` is open; both read as success even when the device refused the
+requested timeout. `max_timeout` and `min_timeout` are both `0` on this
+device, so the real range check lives inside `iTCO_wdt_set_timeout()` and a
+refusal leaves the previous value (30 s) in place with only a warning in the
+journal. The check that proves it:
+
+```bash
+cat /sys/class/watchdog/watchdog0/timeout      # expect 120, not 30
+journalctl -b -1 -u init.scope | grep -i 'hardware watchdog'
+```
+
+**Not yet observed firing.** Like the forced-reboot timer before it, the reset
+itself is only proven by the next wedge. Unlike that timer, nothing in its path
+runs in userspace.
+
+**A wedge with a staged deployment pending now forfeits the update.** The
+reboot-bounding design above went out of its way to avoid cutting
+`ostree-finalize-staged.service` short, and `FINALIZE_WAIT_SECONDS` still holds
+the *software* forced reboot for it. A hardware reset cannot be held for
+anything. In practice this costs nothing that was not already lost: the
+watchdog only fires once PID 1 has stopped dispatching, at which point the
+finalize is not running either and the previous outcome was the power button —
+but the sentence above about "6 more minutes … the trade that keeps the update"
+describes the software path only, and does not survive into the watchdog case.
+
+**A narrower fix exists and is not applied yet.** Masking
+`plymouth-reboot.service` removes the specific start job that blocks the
+reboot. The two are complementary, not alternatives, and the case for doing
+both is strong: with the mask the common case reboots in seconds with a
+flushed journal and an intact ostree finalization, whereas the watchdog alone
+makes every future occurrence cost ~3 minutes, an unsynced journal and a
+forfeited staged deployment. The objections are weaker than they first look —
+the karg hazard applies to `plymouth.enable=0`, not to a `/dev/null` symlink
+under `files/rootfs/etc/systemd/system/`, which is declarative and reversible;
+and "`systemd-reboot.service` could equally block on another DRM consumer" is
+an argument for keeping the watchdog as the backstop, not for leaving the one
+blocker that actually fired twice. It is held only because the watchdog is the
+change that makes the machine recoverable at all, and shipping one variable at
+a time is what lets the next occurrence say which one worked.
 
 ### Snapshots were being thrown away by journald
 
-All four of the 2026-10/11 incidents lost their display diagnostics to
+All three of the 2026-10/11 incidents lost their display diagnostics to
 journald's per-unit rate limit:
 
 ```
@@ -412,17 +448,32 @@ Suppressed 12404 messages from gnome-hang-monitor.service
 ```
 
 The sections that survived are `process status`, `limits`, `threads` and
-`memory map`. Everything *after* the memory map — DRM devices, connector state,
-runtime power state, `nvidia-smi`, the DRM client walk — was dropped from every
-snapshot of every incident. A compositor's `/proc/<pid>/maps` is 11,000-12,000
-lines on its own, which exceeds the 10,000-message default burst in a single
-30 s window.
+`memory map`. Everything *after* the memory map was dropped from every snapshot
+of every incident: the **`eu-stack` userspace backtraces of every compositor
+thread** — the most valuable section for a shell that is alive but not
+dispatching, and the thing the memory map exists to annotate — then login
+sessions, inhibitors, DRM devices, connector state, runtime power state,
+`nvidia-smi`, the debugfs reads and the DRM client walk. A compositor's
+`/proc/<pid>/maps` is 11,000-12,000 lines on its own, which exceeds the
+10,000-message default burst in a single 30 s window.
 
 Fixed from both ends: `gnome-hang-monitor.service` sets
 `LogRateLimitIntervalSec=30s` with `LogRateLimitBurst=60000`, and the monitor
-bounds the map to `MEMORY_MAP_MAX_LINES` (400) with the total line count
-printed, since its tail is the least useful part of a snapshot and its size is
-the only unbounded one.
+filters the map to the mappings that carry a pathname, capped at
+`MEMORY_MAP_MAX_MAPPINGS` (1000), counting the anonymous ones instead of
+printing them.
+
+**Not a `head -n`.** That was the first attempt and it was backwards. The map
+is address-sorted, so its head is the executable followed by hardened_malloc's
+anonymous reservations — 350 of the first 400 lines even for a plain `bash` —
+while every shared library sits at the end above `0x7f...`. A head would have
+kept 400 lines of slab reserve and zero libraries, destroying the one thing
+the section is read for: resolving an address from the `eu-stack` backtraces
+printed immediately after it. The filter is also a single `awk` pass rather
+than a `wc -l` plus a bounded read, because each read of `/proc/<pid>/maps`
+walks every VMA under the target's `mmap_read_lock` — and a thread wedged in
+an NVIDIA fault path holding `mmap_write_lock` is exactly the situation being
+diagnosed.
 
 ## After the next occurrence
 

@@ -85,14 +85,14 @@ TimeoutStopSec=10s
 
 # A snapshot is thousands of journal lines, which is more than journald's
 # per-unit default allows in one 30 s window (RateLimitBurst=10000). It silently
-# dropped the remainder of every snapshot in all four 2026-10/11 wedge
+# dropped the remainder of every snapshot in all three 2026-10/11 wedge
 # incidents -- "Suppressed 12404 messages from gnome-hang-monitor.service" --
-# and what it dropped was everything after the memory map: the DRM devices,
-# connector state, runtime power state, nvidia-smi output and the DRM client
-# walk, i.e. precisely the sections a display-driver wedge needs. The script
-# also bounds the memory map now, but keep the headroom: losing the evidence is
-# worse than a large journal, and journald's own SystemMaxUse= still caps the
-# total on disk.
+# and what it dropped was everything after the memory map: the eu-stack thread
+# backtraces, then the DRM devices, connector state, runtime power state,
+# nvidia-smi output and the DRM client walk, i.e. precisely the sections a
+# display-driver wedge needs. The script also filters the memory map now, but
+# keep the headroom: losing the evidence is worse than a large journal, and
+# journald's own SystemMaxUse= still caps the total on disk.
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=60000
 

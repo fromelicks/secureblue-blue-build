@@ -32,8 +32,10 @@ monitor records a snapshot under the `gnome-diagnostics` journal identifier:
 
 - GNOME Shell process and per-thread state, kernel wait channels, syscalls, and
   kernel stacks;
-- its memory map, bounded to `MEMORY_MAP_MAX_LINES` (400) lines with the total
-  line count printed;
+- its memory map, filtered to the mappings that carry a pathname (libraries,
+  the executable, `[stack]`/`[heap]`/`[vdso]`), capped at
+  `MEMORY_MAP_MAX_MAPPINGS` (1000), with the anonymous mappings counted rather
+  than printed;
 - best-effort userspace backtraces from `eu-stack`;
 - user-session and inhibitor state;
 - DRM cards, connector state, runtime power state, and the DRM debugfs
@@ -79,14 +81,23 @@ this compositor before it is signalled.
 
 A snapshot is thousands of journal lines, which is more than journald's
 per-unit default (`RateLimitBurst=10000` per 30 s) allows. It silently dropped
-the tail of every snapshot in all four 2026-10/11 lock-screen wedges, and the
+the tail of every snapshot in all three 2026-10/11 lock-screen wedges, and the
 tail is where the display diagnostics are — see
 [`nvidia-dpms-lock-hang.md`](nvidia-dpms-lock-hang.md). The unit therefore
-raises the limit to `LogRateLimitBurst=60000` and the script bounds the one
+raises the limit to `LogRateLimitBurst=60000` and the script filters the one
 section whose size was unbounded, `/proc/<pid>/maps`. Keep both: raising the
 limit alone leaves a 12,000-line section competing with the sections that
-matter, and bounding the map alone leaves no headroom for the DRM client walk
+matter, and filtering the map alone leaves no headroom for the DRM client walk
 on a machine with many processes.
+
+**Do not "simplify" that filter to `head -n`.** The map is sorted by address,
+so its head is the executable followed by hardened_malloc's anonymous
+reservations — 350 of the first 400 lines even for a plain `bash` — and every
+shared library is at the end. A head would drop exactly what the section is
+for: resolving an address from the `eu-stack` backtraces printed right after
+it. It is also a single `awk` pass on purpose, because each read of
+`/proc/<pid>/maps` walks every VMA under the target's `mmap_read_lock`, and a
+thread wedged in a driver fault path is the case being diagnosed.
 
 Per-thread wait channels, syscalls and kernel stacks are captured at *every*
 detail level — they are plain `/proc` reads. Only `eu-stack` and the system-wide
