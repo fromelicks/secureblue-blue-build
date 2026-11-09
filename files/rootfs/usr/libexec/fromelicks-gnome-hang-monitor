@@ -38,6 +38,16 @@ FINALIZE_UNIT=ostree-finalize-staged.service
 FINALIZE_WAIT_SECONDS=${FINALIZE_WAIT_SECONDS:-360}
 BLOCKED_TASKS_DUMP_UNIT=fromelicks-sysrq-show-blocked.service
 
+# A compositor's /proc/<pid>/maps is 11,000-12,000 lines, which on its own
+# exceeds journald's per-unit rate limit for a 30 s window and took every later
+# section of the snapshot with it in all three 2026-10/11 wedge incidents. The
+# unit raises that limit, but the map is still the only section whose size is
+# unbounded, so it is also filtered -- see print_proc_maps for why the filter is
+# "file-backed" and not "the first N lines". This caps the mappings kept.
+MEMORY_MAP_MAX_MAPPINGS=${MEMORY_MAP_MAX_MAPPINGS:-1000}
+case "$MEMORY_MAP_MAX_MAPPINGS" in ''|*[!0-9]*) MEMORY_MAP_MAX_MAPPINGS=1000 ;; esac
+[ "$MEMORY_MAP_MAX_MAPPINGS" -ge 1 ] || MEMORY_MAP_MAX_MAPPINGS=1000
+
 # These decide whether the machine reboots, so a drifted value must not quietly
 # shorten the wait. A non-integer ("60s") would make the grace loop's test fail
 # and skip straight to the reboot; fall back to the default and clamp to a floor
@@ -88,6 +98,14 @@ PSI_MEM_FULL_THRESHOLD=${PSI_MEM_FULL_THRESHOLD:-25}
 log_info() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p info; }
 log_warn() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p warning; }
 log_err() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p err; }
+# journald only syncs the journal to disk immediately at priority <= LOG_CRIT;
+# everything else waits for SyncIntervalSec (5 min by default) plus kernel
+# writeback. Since 2026-11-09 the machine can be reset by the hardware watchdog
+# about two minutes after a wedge, so the last snapshot -- the only one the DIFR
+# holder appears in -- has to be on disk before that. Use this for the lines
+# that immediately precede a reboot: the sync flushes everything written before
+# them too. See docs/nvidia-dpms-lock-hang.md.
+log_crit() { printf '%s\n' "$*" | systemd-cat -t "$TAG" -p crit; }
 
 seconds_ago() {
   date -d "$1 seconds ago" -Iseconds 2>/dev/null || date -Iseconds
@@ -184,6 +202,42 @@ print_proc_file() {
   else
     printf '(unavailable)\n'
   fi
+}
+
+# /proc/<pid>/maps, filtered down to the mappings that carry a pathname.
+#
+# Bounding this file by taking the first N lines would be worse than useless.
+# The map is sorted by address, so the head is the executable followed by
+# hardened_malloc's anonymous reservations -- 350 of the first 400 lines even
+# for a plain bash -- while every shared library sits at the very end, above
+# 0x7f.... A head would therefore drop exactly the part the section exists for:
+# turning an address from the eu-stack backtraces printed right after it, or
+# from a wchan or a sysrq frame, into library+offset. Keeping the lines with a
+# pathname keeps the libraries, the executable and [stack]/[heap]/[vdso], and
+# drops the anonymous bulk, which no address lookup needs.
+#
+# One awk pass, deliberately: /proc/<pid>/maps is generated per-VMA under the
+# target's mmap_read_lock, so a second read (a `wc -l` for a total, say) would
+# walk all 12,000 VMAs again and take that lock again -- and a thread wedged in
+# an NVIDIA fault path under mmap_write_lock is the exact case being diagnosed.
+# The counts come out of the same pass instead.
+print_proc_maps() {
+  local path="$1" limit="$2"
+  if [ ! -r "$path" ]; then
+    printf '(unavailable)\n'
+    return 0
+  fi
+  # Braces, because the redirection is the shell's: `cmd <missing 2>/dev/null`
+  # applies 2>/dev/null only after the open has already failed and printed.
+  { awk -v limit="$limit" '
+      NF >= 6 { if (++named <= limit) print; next }
+      { anon++ }
+      END {
+        if (named > limit)
+          printf "(%d further named mappings omitted by the %d cap)\n", named - limit, limit
+        printf "(%d anonymous mappings omitted; %d named kept)\n", anon + 0, (named > limit ? limit : named + 0)
+      }
+    ' "$path"; } 2>/dev/null || printf '(read failed)\n'
 }
 
 # ── system-wide starvation detection ───────────────────────────────────────
@@ -304,8 +358,8 @@ collect_thread_state() {
     esac
   done
 
-  echo "--- gnome-shell memory map ---"
-  print_proc_file "/proc/$pid/maps"
+  echo "--- gnome-shell memory map (named mappings only) ---"
+  print_proc_maps "/proc/$pid/maps" "$MEMORY_MAP_MAX_MAPPINGS"
 
   # eu-stack is the only expensive part of this function -- it stops the target
   # to unwind it -- so it is the only part gated on full detail. wchan, syscall
@@ -434,7 +488,12 @@ collect_drm_clients() {
       seen[$key]=1
       comm=$(cat "$proc/comm" 2>/dev/null || printf unknown)
       uid=$(awk '/^Uid:/ { print $2; exit }' "$proc/status" 2>/dev/null)
-      context=$(cat "$proc/attr/current" 2>/dev/null || printf unavailable)
+      # NUL-terminated, so a plain command substitution logs a bash warning per
+      # process -- noise in the one journal window we are trying to preserve.
+      # Braced: with `tr <"$path" 2>/dev/null` the shell's own "No such file"
+      # for a process that exited mid-walk still reaches stderr, which is the
+      # same noise by another route, 4000 times over.
+      context=$({ tr -d '\0' <"$proc/attr/current"; } 2>/dev/null || printf unavailable)
       echo "[pid=$pid uid=${uid:-unknown} comm=$comm device=$target context=$context]"
 
       # Record every fdinfo entry for this process/device pair. DRM fdinfo
@@ -801,7 +860,7 @@ force_reboot_now() {
     sleep 5
     waited=$((waited + 5))
   done
-  log_err "monitor: the orderly reboot did not finish within ${FORCE_REBOOT_AFTER_SECONDS}s; forcing one"
+  log_crit "monitor: the orderly reboot did not finish within ${FORCE_REBOOT_AFTER_SECONDS}s; forcing one"
   systemctl reboot --force ||
     log_err "monitor: the forced reboot failed; the machine needs the power button"
 }
@@ -885,7 +944,7 @@ handle_driver_wedge() {
   # reboot back forever. The orderly reboot below flushes and unmounts
   # everything, and systemd-shutdown bounds its own final sync. Not reboot -f,
   # so the journal, and with it this incident's evidence, is flushed to disk.
-  log_err "monitor: gnome-shell PID $pid still blocked inside the NVIDIA driver after ${waited}s ($(join_lines "$wedged")); rebooting"
+  log_crit "monitor: gnome-shell PID $pid still blocked inside the NVIDIA driver after ${waited}s ($(join_lines "$wedged")); rebooting"
   if ! timeout -k 5s 30s systemctl reboot >/dev/null 2>&1; then
     log_err "monitor: systemctl reboot failed; the machine needs a manual reboot"
   fi

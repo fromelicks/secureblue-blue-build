@@ -114,8 +114,23 @@ Still open: whether the "hangs on the lock screen" from before this document
 were the same bug. The boots preceding 2026-09-21 contain neither the wait
 channel nor a `PowerSaveMode` timeout.
 
-Seen on `nvidia-open` 615.71.09 with kernels 7.2.5 and 7.2.7
-(`-200.secureblue.1.fc44`).
+**Not fixed by the Fedora 45 rebase or a newer driver.** The same stack
+reproduced twice on 2026-11-09 under `nvidia-open` **620.70.06** and kernel
+**7.2.15-300.secureblue.1.fc45**, with the frame addresses barely moved
+(`nvWriteGpEntry+0x112` and `+0x10e`, `nvDIFRPrefetchSurfaces+0x155` both
+times). Four driver/kernel combinations now carry it:
+
+| Date | Kernel | Driver | Holder |
+|---|---|---|---|
+| 2026-09-21 | 7.2.5-200.fc44 | 615.71.09 | not captured (dump not yet deployed) |
+| 2026-09-22 | 7.2.7-200.fc44 | 615.71.09 | not captured |
+| 2026-09-23 | 7.2.7-200.fc44 | 615.71.09 | PID 553 `nvWriteGpEntry+0x40` |
+| 2026-10-13 | 7.2.9-200.fc44 | 615.71.09 | PID 553 `nvWriteGpEntry+0x109` |
+| 2026-11-09 11:07 | 7.2.15-300.fc45 | 620.70.06 | PID 568 `nvWriteGpEntry+0x112` |
+| 2026-11-09 17:14 | 7.2.15-300.fc45 | 620.70.06 | PID 569 `nvWriteGpEntry+0x10e` |
+
+That consistency across versions is what an upstream NVIDIA report needs, and
+it also means waiting for a driver update is not a strategy.
 
 ## What the image now does
 
@@ -266,12 +281,199 @@ the forced reboot and up to ~11 minutes absolute worst case**, against a wedge
 that previously needed the power button. Add up to 6 more minutes if a staged
 deployment is being finalized, which is the trade that keeps the update.
 
-**Still untested:** no one has yet watched the forced reboot fire on real
-hardware. The paths were exercised against a stubbed `systemctl`: finalize in
-progress then finishing, finalize never finishing (capped), nothing
-finalizing, and the forced reboot itself failing. If even that fails, the power
-button remains the fallback, and the next boot's journal shows how far shutdown
-got.
+**Those timings assume PID 1 is still dispatching jobs. On 2026-11-09 it was
+not, twice, and none of this ran** — see the three sections below. The
+budget that actually bounds a wedge now is `RuntimeWatchdogSec=2min`.
+
+The paths were exercised against a stubbed `systemctl`: finalize in progress
+then finishing, finalize never finishing (capped), nothing finalizing, and the
+forced reboot itself failing.
+
+### The forced reboot was tested on real hardware, and it did not fire
+
+2026-11-09 produced two wedges in one day, both with everything above
+deployed. The recovery ladder ran perfectly each time, including the new
+backstop:
+
+```
+17:14:38  has thread(s) in uninterruptible sleep: 5363 nvkms_ioctl_from_kapi_try_pmlock
+17:14:38  3 consecutive health failures; sending SIGCONT+SIGTERM to gnome-shell PID 5347
+17:14:53  ignored SIGTERM for 15s; sending SIGKILL
+17:15:38  Started fromelicks-wedge-force-reboot.timer
+17:15:38  monitor: a forced reboot is armed for 180s from now if the orderly one stalls
+17:15:38  still blocked inside the NVIDIA driver after 60s …; rebooting
+```
+
+The timer was created with the right properties, was never stopped, and had no
+staged deployment to wait on. **It left no trace of ever firing** — no
+`Starting fromelicks-wedge-force-reboot.service`, no "the orderly reboot did
+not finish within 180s", and not even the
+`Requested transaction contradicts existing jobs` that systemd logs when it
+refuses a start job mid-shutdown (`polkit.service` got exactly that message in
+the same window, so the mechanism was working). The machine then sat dead for
+**2 h 46 min**; the 11:07 wedge sat dead for **69 min**. Both ended with the
+power button.
+
+### Why: the reboot is blocked on plymouth, inside the same wedged driver
+
+Both incidents end on the *same journal line*, and it is the last thing PID 1
+ever says:
+
+```
+11:08:45.568  Starting plymouth-reboot.service - Show Plymouth Reboot Screen...
+11:09:30.735  plymouth-reboot.service: start-post operation timed out. Terminating.
+              ← nothing, ever again
+
+17:15:40.1    (service started)
+17:16:25.188  plymouth-reboot.service: start-post operation timed out. Terminating.
+              ← nothing, ever again
+```
+
+45.17 s and 45.09 s after the service started, i.e. exactly
+`DefaultTimeoutStartSec=45s`. `plymouth-reboot.service` is
+`ExecStart=/usr/bin/plymouthd --mode=reboot --attach-to-session` with
+`ExecStartPost=-/usr/bin/plymouth show-splash`, `Type=forking`, and — decisively
+— `Before=systemd-reboot.service`. `plymouth show-splash` needs the DRM device
+that the DIFR prefetch has locked, so it blocks uninterruptibly; `Terminating`
+sends it a SIGTERM it cannot receive; the start job can never complete; and
+`systemd-reboot.service` is ordered after it. **The reboot is structurally
+unreachable.**
+
+PID 1 also stops logging at that instant and never dispatches the force-reboot
+timer two minutes later, while `systemd-journald` was never stopped (no
+`Stopping systemd-journald`, and `NetworkManager` was still logging at
+11:10:35) and had hours of idle NVMe to flush anything buffered. The most
+likely reason is PID 1 blocking on `/dev/console`, which with
+`nvidia-drm.fbdev=1` is the wedged device — but that is inference, not
+evidence. It does not matter for the conclusion:
+
+> Every backstop the image had lived inside PID 1. `reboot.target`'s
+> `JobTimeoutAction=reboot-force`, the transient `systemd-run` force-reboot
+> timer, and `RebootWatchdogSec=5min` all need PID 1 to still be dispatching
+> jobs. All three were armed. None of them fired.
+
+Earlier revisions of this document called `RebootWatchdogSec=5min` and
+`reboot.target`'s `JobTimeoutAction=reboot-force` "two backstops" for a reboot
+that stalls on the driver. That was wrong, and the two 2026-11-09 outages are
+the proof.
+
+### The hardware watchdog is the only backstop left
+
+`files/rootfs/etc/systemd/system.conf.d/10-watchdog.conf` now also sets
+
+```
+RuntimeWatchdogSec=2min
+```
+
+which hands `/dev/watchdog` (`iTCO_wdt`, `timeout=30`, `nowayout=0`) to PID 1
+for the whole uptime rather than only the final reboot phase. systemd programs
+the hardware timeout to that value and pings at half the interval, so a PID 1
+that stops dispatching for more than ~2 minutes gets the machine reset by
+hardware — no userspace involvement, which is the entire point.
+
+Two minutes is comfortably longer than any legitimate PID 1 stall (its own work
+is milliseconds of event-loop dispatch, and `init.scope` carries `MemoryMin=`
+so reclaim cannot push it out — see
+[`memory-pressure-hangs.md`](memory-pressure-hangs.md)) and far shorter than
+the 69-minute and 2 h 46-minute outages it replaces.
+
+Deliberately **no** `RuntimeWatchdogPreSec=`/`RuntimeWatchdogPreGovernor=`: a
+`panic` pretimeout would be the only way to capture what PID 1 was stuck on,
+but `iTCO_wdt` exposes no `pretimeout` attribute under
+`/sys/class/watchdog/watchdog0`, so the governor has nothing to drive. A plain
+reset leaves no dump, so the evidence still has to come from the monitor's
+snapshots taken before the reboot — which is why their rate limiting
+(below) mattered enough to fix in the same change.
+
+That also puts the snapshots on a clock. journald syncs the journal to disk
+immediately only at priority `<= LOG_CRIT`; everything else waits for
+`SyncIntervalSec` (5 min) plus kernel writeback, and a hardware reset two
+minutes later takes the page cache with it. The previous failure mode gave
+writeback 69 minutes; this one may not. The monitor therefore logs the two
+lines that immediately precede a reboot at `crit`, which forces a sync of
+everything written before them, the last snapshot included.
+
+**Verify the hardware timeout, not the configured one.**
+`systemctl show -p RuntimeWatchdogUSec` echoes what was parsed from
+`system.conf.d`, and `/sys/class/watchdog/watchdog0/state` only reports that
+`/dev/watchdog` is open; both read as success even when the device refused the
+requested timeout. `max_timeout` and `min_timeout` are both `0` on this
+device, so the real range check lives inside `iTCO_wdt_set_timeout()` and a
+refusal leaves the previous value (30 s) in place with only a warning in the
+journal. The check that proves it:
+
+```bash
+cat /sys/class/watchdog/watchdog0/timeout      # expect 120, not 30
+journalctl -b -1 -u init.scope | grep -i 'hardware watchdog'
+```
+
+**Not yet observed firing.** Like the forced-reboot timer before it, the reset
+itself is only proven by the next wedge. Unlike that timer, nothing in its path
+runs in userspace.
+
+**A wedge with a staged deployment pending now forfeits the update.** The
+reboot-bounding design above went out of its way to avoid cutting
+`ostree-finalize-staged.service` short, and `FINALIZE_WAIT_SECONDS` still holds
+the *software* forced reboot for it. A hardware reset cannot be held for
+anything. In practice this costs nothing that was not already lost: the
+watchdog only fires once PID 1 has stopped dispatching, at which point the
+finalize is not running either and the previous outcome was the power button —
+but the sentence above about "6 more minutes … the trade that keeps the update"
+describes the software path only, and does not survive into the watchdog case.
+
+**A narrower fix exists and is not applied yet.** Masking
+`plymouth-reboot.service` removes the specific start job that blocks the
+reboot. The two are complementary, not alternatives, and the case for doing
+both is strong: with the mask the common case reboots in seconds with a
+flushed journal and an intact ostree finalization, whereas the watchdog alone
+makes every future occurrence cost ~3 minutes, an unsynced journal and a
+forfeited staged deployment. The objections are weaker than they first look —
+the karg hazard applies to `plymouth.enable=0`, not to a `/dev/null` symlink
+under `files/rootfs/etc/systemd/system/`, which is declarative and reversible;
+and "`systemd-reboot.service` could equally block on another DRM consumer" is
+an argument for keeping the watchdog as the backstop, not for leaving the one
+blocker that actually fired twice. It is held only because the watchdog is the
+change that makes the machine recoverable at all, and shipping one variable at
+a time is what lets the next occurrence say which one worked.
+
+### Snapshots were being thrown away by journald
+
+All three of the 2026-10/11 incidents lost their display diagnostics to
+journald's per-unit rate limit:
+
+```
+Suppressed 12325 messages from gnome-hang-monitor.service
+Suppressed 12365 messages from gnome-hang-monitor.service
+Suppressed 12404 messages from gnome-hang-monitor.service
+```
+
+The sections that survived are `process status`, `limits`, `threads` and
+`memory map`. Everything *after* the memory map was dropped from every snapshot
+of every incident: the **`eu-stack` userspace backtraces of every compositor
+thread** — the most valuable section for a shell that is alive but not
+dispatching, and the thing the memory map exists to annotate — then login
+sessions, inhibitors, DRM devices, connector state, runtime power state,
+`nvidia-smi`, the debugfs reads and the DRM client walk. A compositor's
+`/proc/<pid>/maps` is 11,000-12,000 lines on its own, which exceeds the
+10,000-message default burst in a single 30 s window.
+
+Fixed from both ends: `gnome-hang-monitor.service` sets
+`LogRateLimitIntervalSec=30s` with `LogRateLimitBurst=60000`, and the monitor
+filters the map to the mappings that carry a pathname, capped at
+`MEMORY_MAP_MAX_MAPPINGS` (1000), counting the anonymous ones instead of
+printing them.
+
+**Not a `head -n`.** That was the first attempt and it was backwards. The map
+is address-sorted, so its head is the executable followed by hardened_malloc's
+anonymous reservations — 350 of the first 400 lines even for a plain `bash` —
+while every shared library sits at the end above `0x7f...`. A head would have
+kept 400 lines of slab reserve and zero libraries, destroying the one thing
+the section is read for: resolving an address from the `eu-stack` backtraces
+printed immediately after it. The filter is also a single `awk` pass rather
+than a `wc -l` plus a bounded read, because each read of `/proc/<pid>/maps`
+walks every VMA under the target's `mmap_read_lock` — and a thread wedged in
+an NVIDIA fault path holding `mmap_write_lock` is exactly the situation being
+diagnosed.
 
 ## After the next occurrence
 
